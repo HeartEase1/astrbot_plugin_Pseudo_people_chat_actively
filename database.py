@@ -123,6 +123,21 @@ class DatabaseManager:
             ON message_send_records(user_id, send_time)
         """)
 
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pending_tasks_user_id
+            ON pending_tasks(user_id)
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pending_tasks_task_id
+            ON pending_tasks(task_id)
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pending_tasks_status
+            ON pending_tasks(status, trigger_time)
+        """)
+
         self.conn.commit()
         logger.info("[ProactiveReply] [数据库] 数据表创建完成")
 
@@ -271,8 +286,10 @@ class DatabaseManager:
 
                 self.conn.commit()
             except sqlite3.Error as e:
+                self.conn.rollback()
                 logger.error(f"[ProactiveReply] [数据库] 更新用户活跃时间失败: {e}")
             except Exception as e:
+                self.conn.rollback()
                 logger.error(f"[ProactiveReply] [数据库] 更新用户活跃时间发生未知错误: {e}")
 
         await asyncio.to_thread(_update)
@@ -319,6 +336,11 @@ class DatabaseManager:
         """
         def _add():
             try:
+                # 检查数据库连接
+                if not self.conn:
+                    logger.warning(f"[ProactiveReply] [数据库] 数据库连接已关闭，跳过添加任务")
+                    return
+
                 cursor = self.conn.cursor()
                 now = self._get_beijing_timestamp()
 
@@ -335,29 +357,44 @@ class DatabaseManager:
                 logger.info(f"[ProactiveReply] [任务注册] 用户[{user_id[:8]}...]任务注册成功，任务ID：{task_id}，"
                            f"触发时间：{trigger_dt.strftime('%Y-%m-%d %H:%M')}（北京时间）")
             except sqlite3.Error as e:
+                self.conn.rollback()
                 logger.error(f"[ProactiveReply] [数据库] 添加任务失败: {e}")
             except (ValueError, TypeError) as e:
+                self.conn.rollback()
                 logger.error(f"[ProactiveReply] [数据库] 任务数据格式错误: {e}")
             except Exception as e:
+                self.conn.rollback()
                 logger.error(f"[ProactiveReply] [数据库] 添加任务发生未知错误: {e}")
 
         await asyncio.to_thread(_add)
 
-    async def get_pending_tasks(self, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    async def get_pending_tasks(self, user_id: Optional[str] = None, task_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         获取待执行任务
 
         Args:
             user_id: 用户ID，为None时获取所有用户的任务
+            task_id: 任务ID，为None时获取所有任务
 
         Returns:
             任务列表
         """
         def _get():
             try:
+                # 检查数据库连接
+                if not self.conn:
+                    logger.warning(f"[ProactiveReply] [数据库] 数据库连接已关闭，返回空任务列表")
+                    return []
+
                 cursor = self.conn.cursor()
 
-                if user_id:
+                if task_id:
+                    # 直接通过 task_id 查询
+                    cursor.execute("""
+                        SELECT * FROM pending_tasks
+                        WHERE task_id = ? AND status = 0
+                    """, (task_id,))
+                elif user_id:
                     cursor.execute("""
                         SELECT * FROM pending_tasks
                         WHERE user_id = ? AND status = 0
@@ -402,6 +439,11 @@ class DatabaseManager:
         """
         def _update():
             try:
+                # 检查数据库连接
+                if not self.conn:
+                    logger.warning(f"[ProactiveReply] [数据库] 数据库连接已关闭，跳过更新任务状态")
+                    return
+
                 cursor = self.conn.cursor()
                 now = self._get_beijing_timestamp()
 
@@ -416,8 +458,10 @@ class DatabaseManager:
                 status_text = {0: "待执行", 1: "已执行", 2: "执行失败", 3: "已取消"}
                 logger.info(f"[ProactiveReply] [任务状态] 任务[{task_id}]状态更新为：{status_text.get(status, '未知')}")
             except sqlite3.Error as e:
+                self.conn.rollback()
                 logger.error(f"[ProactiveReply] [数据库] 更新任务状态失败: {e}")
             except Exception as e:
+                self.conn.rollback()
                 logger.error(f"[ProactiveReply] [数据库] 更新任务状态发生未知错误: {e}")
 
         await asyncio.to_thread(_update)
@@ -618,6 +662,11 @@ class DatabaseManager:
 
     async def close(self):
         """关闭数据库连接"""
+        def _close():
+            if self.conn:
+                self.conn.close()
+                logger.info("[ProactiveReply] [数据库] 数据库连接已关闭")
+
         if self.conn:
-            self.conn.close()
-            logger.info("[ProactiveReply] [数据库] 数据库连接已关闭")
+            await asyncio.to_thread(_close)
+            self.conn = None

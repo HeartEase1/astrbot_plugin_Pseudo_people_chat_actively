@@ -19,7 +19,7 @@
   "conversation_end_threshold": {
     "description": "对话结束判定阈值（分钟）",
     "type": "int",
-    "default": 5,
+    "default": 10,
     "hint": "用户最后一条消息后无新消息的时长"
   },
   "conversation_summary_max_limit": {

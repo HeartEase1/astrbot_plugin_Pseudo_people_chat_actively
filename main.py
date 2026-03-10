@@ -21,7 +21,8 @@ from .database import DatabaseManager
 from .scheduler import TaskScheduler
 
 # 常量定义
-CONVERSATION_END_THRESHOLD_MINUTES = 5  # 对话结束判定阈值（分钟）
+CONVERSATION_END_THRESHOLD_MINUTES = 10  # 对话结束判定阈值（分钟）
+CONVERSATION_SUMMARY_COOLDOWN_HOURS = 1  # 对话总结冷却时间（小时）
 INACTIVE_1D_HOURS = 24  # 1天未活跃阈值（小时）
 INACTIVE_6D_HOURS = 144  # 6天未活跃阈值（小时）
 MIN_EVENT_INTERVAL_HOURS = 4  # 事件最小间隔（小时）
@@ -63,8 +64,14 @@ class ProactiveReplyPlugin(Star):
         # 对话结束倒计时任务字典 {user_id: asyncio.Task}
         self.conversation_timers: Dict[str, asyncio.Task] = {}
 
+        # 对话总结冷却时间记录 {user_id: timestamp}
+        self.conversation_summary_cooldown: Dict[str, float] = {}
+
+        # 初始化状态标志
+        self._initialized = False
+
         # 启动初始化任务
-        asyncio.create_task(self._async_init())
+        self._init_task = asyncio.create_task(self._async_init())
 
         logger.info("[ProactiveReply] [插件初始化] 插件初始化完成")
 
@@ -101,7 +108,7 @@ class ProactiveReplyPlugin(Star):
                 self.config["daily_max_greeting_count"] = 2
 
             max_event = self.config.get("daily_max_event_count", 2)
-            if max_event > 3:
+            if max_event > 2:
                 logger.warning(f"[ProactiveReply] [配置验证] 每日事件次数超过限制（{max_event}），设置为2")
                 self.config["daily_max_event_count"] = 2
             elif max_event < 0:
@@ -118,10 +125,10 @@ class ProactiveReplyPlugin(Star):
                 self.config["qq_msg_frequency_limit"] = 5
 
             # 验证对话结束阈值
-            threshold = self.config.get("conversation_end_threshold", 5)
+            threshold = self.config.get("conversation_end_threshold", 10)
             if threshold < 1 or threshold > 30:
-                logger.warning(f"[ProactiveReply] [配置验证] 对话结束阈值无效（{threshold}分钟），设置为5分钟")
-                self.config["conversation_end_threshold"] = 5
+                logger.warning(f"[ProactiveReply] [配置验证] 对话结束阈值无效（{threshold}分钟），设置为10分钟")
+                self.config["conversation_end_threshold"] = 10
 
             # 验证消息间隔
             interval = self.config.get("proactive_msg_min_interval", 2)
@@ -198,11 +205,16 @@ class ProactiveReplyPlugin(Star):
             # 恢复未执行的任务
             await self._restore_pending_tasks()
 
+            # 标记初始化完成
+            self._initialized = True
+
             logger.info("[ProactiveReply] [插件初始化] 异步初始化完成")
         except (OSError, RuntimeError) as e:
             logger.error(f"[ProactiveReply] [插件初始化] 异步初始化失败: {e}")
+            self._initialized = False
         except Exception as e:
             logger.error(f"[ProactiveReply] [插件初始化] 异步初始化发生未知错误: {e}")
+            self._initialized = False
 
     async def _register_global_tasks(self):
         """注册全局定时任务"""
@@ -243,6 +255,20 @@ class ProactiveReplyPlugin(Star):
                 "cleanup_old_records",
                 "02:00",
                 lambda: self.db.cleanup_old_send_records(days=OLD_RECORDS_RETENTION_DAYS)
+            )
+
+            # 清理对话总结冷却时间记录（每天凌晨3点）
+            self.scheduler.add_daily_task(
+                "cleanup_summary_cooldown",
+                "03:00",
+                self._cleanup_summary_cooldown
+            )
+
+            # 清理过期的对话倒计时任务（每天凌晨4点）
+            self.scheduler.add_daily_task(
+                "cleanup_conversation_timers",
+                "04:00",
+                self._cleanup_conversation_timers
             )
 
             logger.info("[ProactiveReply] [插件初始化] 全局定时任务注册完成")
@@ -300,6 +326,11 @@ class ProactiveReplyPlugin(Star):
         更新用户活跃状态，触发对话结束判定
         """
         try:
+            # 检查初始化是否完成
+            if not self._initialized:
+                logger.debug("[ProactiveReply] [事件监听] 插件尚未初始化完成，跳过处理")
+                return
+
             # 检查插件是否启用
             if not self.config.get("enable_plugin", True):
                 return
@@ -319,8 +350,11 @@ class ProactiveReplyPlugin(Star):
             if user_id in self.conversation_timers:
                 self.conversation_timers[user_id].cancel()
 
+            # 取消该用户所有待执行的 conversation_end 类型任务
+            await self._cancel_user_conversation_tasks(user_id)
+
             # 启动新的倒计时
-            threshold = self.config.get("conversation_end_threshold", 5) * 60  # 转换为秒
+            threshold = self.config.get("conversation_end_threshold", 10) * 60  # 转换为秒
             self.conversation_timers[user_id] = asyncio.create_task(
                 self._conversation_end_timer(user_id, threshold)
             )
@@ -329,6 +363,43 @@ class ProactiveReplyPlugin(Star):
             logger.error(f"[ProactiveReply] [事件监听] 处理消息事件失败: {e}")
         except Exception as e:
             logger.error(f"[ProactiveReply] [事件监听] 处理消息事件发生未知错误: {e}")
+
+    async def _cleanup_summary_cooldown(self):
+        """清理过期的对话总结冷却时间记录"""
+        try:
+            now = self.scheduler.get_beijing_time().timestamp()
+            cooldown_seconds = CONVERSATION_SUMMARY_COOLDOWN_HOURS * 3600
+
+            # 清理超过冷却时间的记录
+            expired_users = [
+                user_id for user_id, timestamp in self.conversation_summary_cooldown.items()
+                if now - timestamp > cooldown_seconds
+            ]
+
+            for user_id in expired_users:
+                del self.conversation_summary_cooldown[user_id]
+
+            if expired_users:
+                logger.info(f"[ProactiveReply] [定时任务] 清理了{len(expired_users)}条过期的对话总结冷却记录")
+        except Exception as e:
+            logger.error(f"[ProactiveReply] [定时任务] 清理对话总结冷却记录失败: {e}")
+
+    async def _cleanup_conversation_timers(self):
+        """清理已完成的对话倒计时任务"""
+        try:
+            # 清理已完成的任务
+            completed_users = [
+                user_id for user_id, task in self.conversation_timers.items()
+                if task.done()
+            ]
+
+            for user_id in completed_users:
+                del self.conversation_timers[user_id]
+
+            if completed_users:
+                logger.info(f"[ProactiveReply] [定时任务] 清理了{len(completed_users)}个已完成的对话倒计时任务")
+        except Exception as e:
+            logger.error(f"[ProactiveReply] [定时任务] 清理对话倒计时任务失败: {e}")
 
     async def _conversation_end_timer(self, user_id: str, threshold: int):
         """
@@ -341,7 +412,20 @@ class ProactiveReplyPlugin(Star):
         try:
             await asyncio.sleep(threshold)
 
+            # 检查冷却时间
+            now = self.scheduler.get_beijing_time().timestamp()
+            last_summary_time = self.conversation_summary_cooldown.get(user_id, 0)
+            cooldown_seconds = CONVERSATION_SUMMARY_COOLDOWN_HOURS * 3600
+
+            if now - last_summary_time < cooldown_seconds:
+                remaining_minutes = int((cooldown_seconds - (now - last_summary_time)) / 60)
+                logger.info(f"[ProactiveReply] [对话判定] 用户[{user_id[:16]}...]对话结束，但在冷却期内（还需{remaining_minutes}分钟），跳过总结")
+                return
+
             logger.info(f"[ProactiveReply] [对话判定] 用户[{user_id[:16]}...]对话结束，触发上下文总结流程")
+
+            # 记录本次总结时间
+            self.conversation_summary_cooldown[user_id] = now
 
             # 触发对话结束后的主动回复流程
             await self._handle_conversation_end(user_id)
@@ -356,6 +440,34 @@ class ProactiveReplyPlugin(Star):
             # 清理已完成的任务
             if user_id in self.conversation_timers:
                 del self.conversation_timers[user_id]
+
+    async def _cancel_user_conversation_tasks(self, user_id: str):
+        """
+        取消用户所有待执行的对话结束类型任务
+
+        Args:
+            user_id: 用户ID
+        """
+        try:
+            # 获取该用户所有待执行的 conversation_end 类型任务
+            pending_tasks = await self.db.get_pending_tasks(user_id)
+
+            cancelled_count = 0
+            for task in pending_tasks:
+                if task['task_type'] == 'conversation_end':
+                    # 从调度器移除任务
+                    self.scheduler.remove_task(task['task_id'])
+                    # 更新数据库状态为已取消
+                    await self.db.update_task_status(task['task_id'], 3, "用户已主动发消息")
+                    cancelled_count += 1
+
+            if cancelled_count > 0:
+                logger.info(f"[ProactiveReply] [任务取消] 用户[{user_id[:16]}...]主动发消息，已取消{cancelled_count}个待执行的对话结束任务")
+
+        except (KeyError, TypeError) as e:
+            logger.error(f"[ProactiveReply] [任务取消] 取消任务失败: {e}")
+        except Exception as e:
+            logger.error(f"[ProactiveReply] [任务取消] 取消任务发生未知错误: {e}")
 
     async def _handle_conversation_end(self, user_id: str):
         """
@@ -380,8 +492,24 @@ class ProactiveReplyPlugin(Star):
                 return
 
             # 2. 生成对话总结
-            # 注意：conversation.history 是字符串格式，不是列表
-            summary = await self._generate_conversation_summary(user_id, conversation.history)
+            # 注意：conversation.history 可能是字符串或列表格式
+            history = conversation.history
+
+            # 处理不同的历史格式
+            if isinstance(history, list):
+                # 如果是列表，转换为字符串
+                history_text = "\n".join([
+                    f"{msg.get('role', 'user')}: {msg.get('content', '')}"
+                    for msg in history if isinstance(msg, dict)
+                ])
+            elif isinstance(history, str):
+                # 如果已经是字符串，直接使用
+                history_text = history
+            else:
+                logger.warning(f"[ProactiveReply] [上下文处理] 未知的对话历史格式: {type(history)}")
+                return
+
+            summary = await self._generate_conversation_summary(user_id, history_text)
 
             if not summary:
                 logger.warning(f"[ProactiveReply] [上下文处理] 用户[{user_id[:16]}...]对话总结生成失败")
@@ -422,9 +550,9 @@ class ProactiveReplyPlugin(Star):
                 return None
 
             # 限制历史长度（按字符数）
-            max_chars = 2000  # 限制最多2000字符
+            max_chars = self.config.get("conversation_summary_max_limit", 20) * 100  # 每条消息约100字符
             if len(history) > max_chars:
-                history = history[-max_chars:]  # 取最后2000字符
+                history = history[-max_chars:]  # 取最后N字符
 
             prompt = f"""请总结以下对话的核心内容，提炼用户的状态、计划、情绪等关键信息：
 
@@ -447,7 +575,7 @@ class ProactiveReplyPlugin(Star):
                 logger.error(f"[ProactiveReply] [上下文处理] LLM调用超时（{LLM_TIMEOUT_SECONDS}秒）")
                 return None
 
-        except Exception as e:
+        except (AttributeError, KeyError, TypeError) as e:
             logger.error(f"[ProactiveReply] [上下文处理] 生成对话总结失败: {e}", exc_info=True)
             # 兜底：使用最后200字符
             try:
@@ -457,9 +585,6 @@ class ProactiveReplyPlugin(Star):
                     return "对话内容：" + history
             except (TypeError, AttributeError) as fallback_error:
                 logger.error(f"[ProactiveReply] [上下文处理] 兜底逻辑也失败: {fallback_error}", exc_info=True)
-            return None
-        except Exception as e:
-            logger.error(f"[ProactiveReply] [上下文处理] 生成对话总结发生未知错误: {e}", exc_info=True)
             return None
 
     async def _llm_decide_proactive_reply(self, user_id: str, summary: str) -> Optional[Dict[str, Any]]:
@@ -541,11 +666,11 @@ class ProactiveReplyPlugin(Star):
 
             return None
 
+        except asyncio.TimeoutError:
+            logger.error(f"[ProactiveReply] [LLM决策] LLM调用超时")
+            return None
         except (json.JSONDecodeError, ValueError, KeyError) as e:
             logger.error(f"[ProactiveReply] [LLM决策] 决策失败: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"[ProactiveReply] [LLM决策] 决策发生未知错误: {e}")
             return None
 
     async def _register_proactive_task(self, user_id: str, decision: Dict[str, Any],
@@ -584,6 +709,9 @@ class ProactiveReplyPlugin(Star):
             min_interval = self.config.get("proactive_msg_min_interval", 2)
             trigger_time = self.scheduler.check_task_interval(trigger_time, existing_times, min_interval)
 
+            # 再次检查防打扰时段（因为间隔调整可能导致时间落入防打扰时段）
+            trigger_time = self.scheduler.adjust_time_avoid_disturb(trigger_time, disturb_start, disturb_end)
+
             # 生成任务ID
             task_id = f"{task_type}_{user_id}_{uuid.uuid4().hex[:8]}"
 
@@ -621,13 +749,14 @@ class ProactiveReplyPlugin(Star):
             task_id: 任务ID
         """
         try:
-            # 获取任务信息
-            tasks = await self.db.get_pending_tasks()
-            task = next((t for t in tasks if t['task_id'] == task_id), None)
+            # 获取任务信息（直接通过 task_id 查询）
+            tasks = await self.db.get_pending_tasks(task_id=task_id)
 
-            if not task:
+            if not tasks:
                 logger.warning(f"[ProactiveReply] [任务执行] 任务[{task_id}]不存在")
                 return
+
+            task = tasks[0]
 
             logger.info(f"[ProactiveReply] [任务执行] 开始执行用户[{task['user_id'][:16]}...]的任务[{task_id}]，"
                        f"任务类型：{task['task_type']}")
@@ -650,10 +779,16 @@ class ProactiveReplyPlugin(Star):
 
         except (KeyError, TypeError, AttributeError) as e:
             logger.error(f"[ProactiveReply] [任务执行] 执行任务失败: {e}")
-            await self.db.update_task_status(task_id, 2, str(e))
+            try:
+                await self.db.update_task_status(task_id, 2, str(e))
+            except Exception as db_error:
+                logger.error(f"[ProactiveReply] [任务执行] 更新任务状态失败: {db_error}")
         except Exception as e:
             logger.error(f"[ProactiveReply] [任务执行] 执行任务发生未知错误: {e}")
-            await self.db.update_task_status(task_id, 2, str(e))
+            try:
+                await self.db.update_task_status(task_id, 2, str(e))
+            except Exception as db_error:
+                logger.error(f"[ProactiveReply] [任务执行] 更新任务状态失败: {db_error}")
 
     async def _generate_proactive_message(self, task: Dict[str, Any]) -> Optional[str]:
         """
@@ -672,28 +807,34 @@ class ProactiveReplyPlugin(Star):
             # 获取人设
             persona_mgr = self.context.persona_manager
             persona = persona_mgr.get_default_persona_v3(umo=user_id)
+            persona_prompt = persona.prompt if persona and hasattr(persona, 'prompt') else ""
 
             # 构建提示词
             prompt = f"""你获得了一次主动回复的机会，请保持人设不变，结合以下内容生成一条自然的主动消息。
+
+人设：{persona_prompt}
 
 对话背景：{task_context.get('summary', '')}
 
 请生成一条简短、自然的主动消息（不超过50字）。"""
 
-            # 调用 LLM
+            # 调用 LLM（添加超时控制）
             provider_id = await self.context.get_current_chat_provider_id(umo=user_id)
-            llm_resp = await self.context.llm_generate(
-                chat_provider_id=provider_id,
-                prompt=prompt
-            )
-
-            return llm_resp.completion_text.strip()
+            try:
+                llm_resp = await asyncio.wait_for(
+                    self.context.llm_generate(
+                        chat_provider_id=provider_id,
+                        prompt=prompt
+                    ),
+                    timeout=LLM_TIMEOUT_SECONDS
+                )
+                return llm_resp.completion_text.strip()
+            except asyncio.TimeoutError:
+                logger.error(f"[ProactiveReply] [消息生成] LLM调用超时（{LLM_TIMEOUT_SECONDS}秒）")
+                return None
 
         except (AttributeError, KeyError) as e:
             logger.error(f"[ProactiveReply] [消息生成] 生成消息失败: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"[ProactiveReply] [消息生成] 生成消息发生未知错误: {e}")
             return None
 
     async def _send_proactive_message(self, user_id: str, message: str) -> bool:
@@ -790,13 +931,13 @@ class ProactiveReplyPlugin(Star):
 
             except AttributeError:
                 logger.debug(f"[ProactiveReply] [戳一戳] 平台不支持戳一戳功能")
-            except ValueError as e:
-                logger.warning(f"[ProactiveReply] [戳一戳] QQ号格式错误: {e}")
+            except (ValueError, TypeError) as e:
+                logger.warning(f"[ProactiveReply] [戳一戳] 参数错误: {e}")
             except Exception as e:
                 logger.warning(f"[ProactiveReply] [戳一戳] 发送戳一戳失败: {e}")
 
-        except Exception as e:
-            logger.error(f"[ProactiveReply] [戳一戳] 戳一戳功能异常: {e}")
+        except (IndexError, ValueError) as e:
+            logger.error(f"[ProactiveReply] [戳一戳] 解析用户ID失败: {e}")
 
     async def _generate_daily_greeting_plan(self):
         """生成每日问候计划"""
@@ -832,12 +973,12 @@ class ProactiveReplyPlugin(Star):
                     if generated_count >= max_count:
                         break
 
-                    # 获取对应的概率
-                    prob = probabilities[generated_count] if generated_count < len(probabilities) else 0.0
+                    # 获取对应的概率（使用时段索引而不是生成计数）
+                    prob = probabilities[idx] if idx < len(probabilities) else 0.0
 
                     # 概率判定
                     if random.random() > prob:
-                        logger.debug(f"[ProactiveReply] [问候计划] 用户[{user_id[:16]}...]第{generated_count + 1}次问候概率未命中，跳过")
+                        logger.debug(f"[ProactiveReply] [问候计划] 用户[{user_id[:16]}...]时段{idx + 1}问候概率未命中，跳过")
                         continue
 
                     # 在时段内随机选择一个时间
@@ -1041,6 +1182,9 @@ class ProactiveReplyPlugin(Star):
                             logger.warning(f"[ProactiveReply] [事件生成] 解析事件时间失败: {e}")
                             continue
 
+                except asyncio.TimeoutError:
+                    logger.error(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]LLM调用超时")
+                    continue
                 except (json.JSONDecodeError, KeyError, TypeError) as e:
                     logger.error(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]事件生成失败: {e}")
                     continue
@@ -1078,7 +1222,14 @@ class ProactiveReplyPlugin(Star):
                         try:
                             provider_id = await self.context.get_current_chat_provider_id(umo=user_id)
 
-                            prompt = """请基于角色人设，生成一条自然的问候/关心消息，因为用户已经1天没有和你聊天了。
+                            # 获取人设
+                            persona_mgr = self.context.persona_manager
+                            persona = persona_mgr.get_default_persona_v3(umo=user_id)
+                            persona_prompt = persona.prompt if persona and hasattr(persona, 'prompt') else ""
+
+                            prompt = f"""请基于角色人设，生成一条自然的问候/关心消息，因为用户已经1天没有和你聊天了。
+
+人设：{persona_prompt}
 
 要求：
 - 保持人设不变
@@ -1110,6 +1261,8 @@ class ProactiveReplyPlugin(Star):
                                 await self.db.update_inactive_touch_time(user_id, "1d")
                                 logger.info(f"[ProactiveReply] [消息发送] 用户[{user_id[:16]}...]的未活跃触达消息发送成功，梯度：1")
 
+                        except asyncio.TimeoutError:
+                            logger.error(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]LLM调用超时")
                         except (AttributeError, TypeError) as e:
                             logger.error(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]梯度1触达失败: {e}")
 
@@ -1122,7 +1275,14 @@ class ProactiveReplyPlugin(Star):
                         try:
                             provider_id = await self.context.get_current_chat_provider_id(umo=user_id)
 
-                            prompt = """请基于角色人设，生成一条带点生气、质问语气的消息，因为用户已经超过6天没有和你聊天了。
+                            # 获取人设
+                            persona_mgr = self.context.persona_manager
+                            persona = persona_mgr.get_default_persona_v3(umo=user_id)
+                            persona_prompt = persona.prompt if persona and hasattr(persona, 'prompt') else ""
+
+                            prompt = f"""请基于角色人设，生成一条带点生气、质问语气的消息，因为用户已经超过6天没有和你聊天了。
+
+人设：{persona_prompt}
 
 要求：
 - 保持人设不变
@@ -1154,6 +1314,8 @@ class ProactiveReplyPlugin(Star):
                                 await self.db.update_inactive_touch_time(user_id, "6d")
                                 logger.info(f"[ProactiveReply] [消息发送] 用户[{user_id[:16]}...]的未活跃触达消息发送成功，梯度：2")
 
+                        except asyncio.TimeoutError:
+                            logger.error(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]LLM调用超时")
                         except (AttributeError, TypeError) as e:
                             logger.error(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]梯度2触达失败: {e}")
 
@@ -1161,8 +1323,6 @@ class ProactiveReplyPlugin(Star):
 
         except (ValueError, KeyError, TypeError) as e:
             logger.error(f"[ProactiveReply] [定时任务] 扫描未活跃用户失败: {e}")
-        except Exception as e:
-            logger.error(f"[ProactiveReply] [定时任务] 扫描未活跃用户发生未知错误: {e}")
 
     async def _execute_greeting_task(self, task_id: str):
         """
@@ -1172,13 +1332,14 @@ class ProactiveReplyPlugin(Star):
             task_id: 任务ID
         """
         try:
-            # 获取任务信息
-            tasks = await self.db.get_pending_tasks()
-            task = next((t for t in tasks if t['task_id'] == task_id), None)
+            # 获取任务信息（直接通过 task_id 查询）
+            tasks = await self.db.get_pending_tasks(task_id=task_id)
 
-            if not task:
+            if not tasks:
                 logger.warning(f"[ProactiveReply] [任务执行] 问候任务[{task_id}]不存在")
                 return
+
+            task = tasks[0]
 
             logger.info(f"[ProactiveReply] [任务执行] 开始执行用户[{task['user_id'][:16]}...]的问候任务[{task_id}]")
 
@@ -1191,7 +1352,14 @@ class ProactiveReplyPlugin(Star):
                 now = self.scheduler.get_beijing_time()
                 time_range = task_context.get('time_range', '')
 
+                # 获取人设
+                persona_mgr = self.context.persona_manager
+                persona = persona_mgr.get_default_persona_v3(umo=user_id)
+                persona_prompt = persona.prompt if persona and hasattr(persona, 'prompt') else ""
+
                 prompt = f"""请基于角色人设，生成一条{time_range}的日常问候消息。
+
+人设：{persona_prompt}
 
 当前时间：{now.strftime('%H:%M')}
 
@@ -1228,14 +1396,15 @@ class ProactiveReplyPlugin(Star):
                 else:
                     await self.db.update_task_status(task_id, 2, "消息发送失败")
 
+            except asyncio.TimeoutError:
+                logger.error(f"[ProactiveReply] [任务执行] 问候任务LLM调用超时")
+                await self.db.update_task_status(task_id, 2, "LLM调用超时")
             except (AttributeError, KeyError) as e:
                 logger.error(f"[ProactiveReply] [任务执行] 问候任务执行失败: {e}")
                 await self.db.update_task_status(task_id, 2, str(e))
 
         except (KeyError, TypeError) as e:
             logger.error(f"[ProactiveReply] [任务执行] 执行问候任务失败: {e}")
-        except Exception as e:
-            logger.error(f"[ProactiveReply] [任务执行] 执行问候任务发生未知错误: {e}")
 
     async def _execute_event_task(self, task_id: str):
         """
@@ -1245,13 +1414,14 @@ class ProactiveReplyPlugin(Star):
             task_id: 任务ID
         """
         try:
-            # 获取任务信息
-            tasks = await self.db.get_pending_tasks()
-            task = next((t for t in tasks if t['task_id'] == task_id), None)
+            # 获取任务信息（直接通过 task_id 查询）
+            tasks = await self.db.get_pending_tasks(task_id=task_id)
 
-            if not task:
+            if not tasks:
                 logger.warning(f"[ProactiveReply] [任务执行] 事件任务[{task_id}]不存在")
                 return
+
+            task = tasks[0]
 
             logger.info(f"[ProactiveReply] [任务执行] 开始执行用户[{task['user_id'][:16]}...]的事件任务[{task_id}]")
 
@@ -1263,7 +1433,14 @@ class ProactiveReplyPlugin(Star):
             try:
                 provider_id = await self.context.get_current_chat_provider_id(umo=user_id)
 
+                # 获取人设
+                persona_mgr = self.context.persona_manager
+                persona = persona_mgr.get_default_persona_v3(umo=user_id)
+                persona_prompt = persona.prompt if persona and hasattr(persona, 'prompt') else ""
+
                 prompt = f"""请基于角色人设，以这件事为话题，生成一条自然的主动消息发给用户。
+
+人设：{persona_prompt}
 
 事件内容：{event_content}
 
@@ -1300,14 +1477,15 @@ class ProactiveReplyPlugin(Star):
                 else:
                     await self.db.update_task_status(task_id, 2, "消息发送失败")
 
+            except asyncio.TimeoutError:
+                logger.error(f"[ProactiveReply] [任务执行] 事件任务LLM调用超时")
+                await self.db.update_task_status(task_id, 2, "LLM调用超时")
             except (AttributeError, KeyError) as e:
                 logger.error(f"[ProactiveReply] [任务执行] 事件任务执行失败: {e}")
                 await self.db.update_task_status(task_id, 2, str(e))
 
         except (KeyError, TypeError) as e:
             logger.error(f"[ProactiveReply] [任务执行] 执行事件任务失败: {e}")
-        except Exception as e:
-            logger.error(f"[ProactiveReply] [任务执行] 执行事件任务发生未知错误: {e}")
 
     async def terminate(self):
         """插件卸载时调用"""
@@ -1321,8 +1499,12 @@ class ProactiveReplyPlugin(Star):
                     logger.debug(f"[ProactiveReply] [插件卸载] 取消用户[{user_id[:16]}...]的对话倒计时任务")
             self.conversation_timers.clear()
 
-            # 关闭调度器
-            await self.scheduler.shutdown()
+            # 关闭调度器（等待所有任务完成）
+            if self.scheduler.is_running:
+                logger.info("[ProactiveReply] [插件卸载] 正在关闭调度器，等待任务完成...")
+                await self.scheduler.shutdown(wait=True)
+                # 等待一小段时间确保任务完成
+                await asyncio.sleep(0.5)
 
             # 关闭数据库
             await self.db.close()

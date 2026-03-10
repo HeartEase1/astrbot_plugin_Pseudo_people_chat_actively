@@ -36,11 +36,16 @@ class TaskScheduler:
             logger.error(f"[ProactiveReply] [定时任务] 调度器启动发生未知错误: {e}")
             raise
 
-    async def shutdown(self):
-        """关闭调度器"""
+    async def shutdown(self, wait: bool = True):
+        """
+        关闭调度器
+
+        Args:
+            wait: 是否等待所有任务完成
+        """
         try:
             if self.is_running:
-                self.scheduler.shutdown(wait=False)
+                self.scheduler.shutdown(wait=wait)
                 self.is_running = False
                 logger.info("[ProactiveReply] [定时任务] 调度器已关闭")
         except RuntimeError as e:
@@ -245,9 +250,15 @@ class TaskScheduler:
         # 如果在防打扰时段，调整到结束时间
         adjusted = target_time.replace(hour=end_hour, minute=0, second=0, microsecond=0)
 
-        # 如果调整后的时间早于原时间（跨天情况），则使用原时间的日期
-        if adjusted < target_time:
-            adjusted = adjusted + timedelta(days=1)
+        # 处理跨天情况：如果防打扰时段跨天（如 23:00-06:00）
+        if start_hour > end_hour:
+            # 如果当前时间在午夜之前（23:00-23:59），调整到第二天的结束时间
+            if target_time.hour >= start_hour:
+                adjusted = adjusted + timedelta(days=1)
+        else:
+            # 正常情况：如果调整后的时间早于原时间，说明出错了，使用原日期
+            if adjusted < target_time:
+                adjusted = target_time.replace(hour=end_hour, minute=0, second=0, microsecond=0)
 
         logger.info(f"[ProactiveReply] [时间校验] 触发时间落在防打扰时段，"
                    f"已顺延至{adjusted.strftime('%Y-%m-%d %H:%M')}（北京时间）")
@@ -257,7 +268,7 @@ class TaskScheduler:
     def check_task_interval(self, new_time: datetime, existing_times: list,
                            min_interval_hours: int) -> Optional[datetime]:
         """
-        检查任务间隔是否满足最小间隔要求
+        检查任务间隔是否满足最小间隔要求，递归调整直到找到合适的时间
 
         Args:
             new_time: 新任务时间
@@ -274,21 +285,33 @@ class TaskScheduler:
             new_time = new_time.astimezone(self.beijing_tz)
 
         min_interval = timedelta(hours=min_interval_hours)
+        adjusted = new_time
+        max_iterations = 10  # 防止无限循环
 
-        for existing_time in existing_times:
-            if existing_time.tzinfo is None:
-                existing_time = self.beijing_tz.localize(existing_time)
-            else:
-                existing_time = existing_time.astimezone(self.beijing_tz)
+        for _ in range(max_iterations):
+            conflict_found = False
 
-            # 计算时间差
-            time_diff = abs((new_time - existing_time).total_seconds())
+            for existing_time in existing_times:
+                if existing_time.tzinfo is None:
+                    existing_time = self.beijing_tz.localize(existing_time)
+                else:
+                    existing_time = existing_time.astimezone(self.beijing_tz)
 
-            if time_diff < min_interval.total_seconds():
-                # 间隔不足，调整时间
-                adjusted = existing_time + min_interval
-                logger.info(f"[ProactiveReply] [时间校验] 与已有任务间隔不足，"
-                           f"已调整至{adjusted.strftime('%Y-%m-%d %H:%M')}（北京时间）")
+                # 计算时间差
+                time_diff = abs((adjusted - existing_time).total_seconds())
+
+                if time_diff < min_interval.total_seconds():
+                    # 间隔不足，调整时间
+                    adjusted = existing_time + min_interval
+                    conflict_found = True
+                    logger.info(f"[ProactiveReply] [时间校验] 与已有任务间隔不足，"
+                               f"已调整至{adjusted.strftime('%Y-%m-%d %H:%M')}（北京时间）")
+                    break  # 重新检查所有任务
+
+            if not conflict_found:
+                # 没有冲突，返回调整后的时间
                 return adjusted
 
-        return new_time
+        # 达到最大迭代次数，返回最后调整的时间
+        logger.warning(f"[ProactiveReply] [时间校验] 达到最大调整次数，使用最后调整的时间")
+        return adjusted
