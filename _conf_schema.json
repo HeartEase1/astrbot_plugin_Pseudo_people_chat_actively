@@ -1,0 +1,110 @@
+{
+  "enable_plugin": {
+    "description": "插件总开关",
+    "type": "bool",
+    "default": true
+  },
+  "disturb_free_start": {
+    "description": "防打扰开始时间（小时，北京时间）",
+    "type": "int",
+    "default": 0,
+    "hint": "防打扰时段开始时间，默认0点"
+  },
+  "disturb_free_end": {
+    "description": "防打扰结束时间（小时，北京时间）",
+    "type": "int",
+    "default": 6,
+    "hint": "防打扰时段结束时间，默认6点"
+  },
+  "conversation_end_threshold": {
+    "description": "对话结束判定阈值（分钟）",
+    "type": "int",
+    "default": 5,
+    "hint": "用户最后一条消息后无新消息的时长"
+  },
+  "conversation_summary_max_limit": {
+    "description": "对话总结的最大历史消息条数",
+    "type": "int",
+    "default": 20
+  },
+  "proactive_msg_min_interval": {
+    "description": "主动消息最小间隔（小时）",
+    "type": "int",
+    "default": 2,
+    "hint": "同一用户两条主动消息的最小间隔"
+  },
+  "enable_inactive_1d_touch": {
+    "description": "1天未活跃用户触达开关",
+    "type": "bool",
+    "default": true
+  },
+  "enable_inactive_6d_touch": {
+    "description": "6天未活跃用户触达开关",
+    "type": "bool",
+    "default": true
+  },
+  "daily_max_greeting_count": {
+    "description": "每日最大问候消息条数",
+    "type": "int",
+    "default": 2,
+    "hint": "最大不可超过2"
+  },
+  "daily_max_event_count": {
+    "description": "每日最大日常事件条数",
+    "type": "int",
+    "default": 2,
+    "hint": "最大不可超过2"
+  },
+  "greeting_time_ranges": {
+    "description": "问候时段配置",
+    "type": "list",
+    "default": [
+      {"name": "早间", "start": 6, "end": 8},
+      {"name": "午间", "start": 12, "end": 12},
+      {"name": "晚间", "start": 18, "end": 20}
+    ],
+    "hint": "基于北京时间判定"
+  },
+  "greeting_probabilities": {
+    "description": "第1、2、3次问候的生成概率",
+    "type": "list",
+    "default": [0.6, 0.2, 0.0],
+    "hint": "第三次固定为0%"
+  },
+  "inactive_scan_time": {
+    "description": "每日未活跃用户扫描时间",
+    "type": "string",
+    "default": "08:00",
+    "hint": "北京时间，格式：HH:MM"
+  },
+  "daily_event_generate_time": {
+    "description": "每日日常事件生成时间",
+    "type": "string",
+    "default": "01:00",
+    "hint": "北京时间，格式：HH:MM"
+  },
+  "daily_greeting_plan_time": {
+    "description": "每日问候计划生成时间",
+    "type": "string",
+    "default": "00:30",
+    "hint": "北京时间，格式：HH:MM"
+  },
+  "enable_group_proactive": {
+    "description": "是否开启群聊场景主动回复",
+    "type": "bool",
+    "default": false,
+    "hint": "默认仅QQ私聊生效"
+  },
+  "qq_msg_frequency_limit": {
+    "description": "单个用户1小时内最多接收的主动消息条数",
+    "type": "int",
+    "default": 2,
+    "hint": "适配QQ平台风控，每个用户独立计算，建议不超过3"
+  },
+  "enable_qq_poke": {
+    "description": "主动消息发送前是否触发QQ戳一戳",
+    "type": "bool",
+    "default": false,
+    "hint": "仅aiocqhttp平台生效"
+  }
+}

@@ -1,0 +1,11 @@
+name: proactive_reply
+version: 1.0.0
+author: Your Name
+display_name: 伪人主动聊天插件
+description: 基于人设与对话上下文的智能主动回复插件，默认适配QQ(aiocqhttp)平台，强制北京时间，支持定时问候、未活跃触达、日常事件分享等全场景主动聊天能力
+license: MIT
+homepage: ""
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.9.2"
+main: main.py
