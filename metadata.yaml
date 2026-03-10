@@ -1,10 +1,10 @@
-name: proactive_reply
-version: 1.0.0
-author: Your Name
+name: astrbot_plugin_pseudo_people_chat_actively
+version: 1.1.0
+author: Heart Ease1
 display_name: 伪人主动聊天插件
 description: 基于人设与对话上下文的智能主动回复插件，默认适配QQ(aiocqhttp)平台，强制北京时间，支持定时问候、未活跃触达、日常事件分享等全场景主动聊天能力
-license: MIT
-homepage: ""
+license: Apache License 2.0
+homepage: "https://github.com/HeartEase1/astrbot_plugin_Pseudo_people_chat_actively"
 support_platforms:
   - aiocqhttp
 astrbot_version: ">=4.9.2"

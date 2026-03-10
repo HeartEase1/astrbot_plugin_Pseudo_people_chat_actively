@@ -1,4 +1,4 @@
-# AstrBot 智能主动回复插件
+# AstrBot 伪人主动回复插件
 
 基于人设、对话上下文、时间规则实现的全场景智能主动回复插件。
 
@@ -303,19 +303,19 @@ astrbot_plugin_Pseudo_people_chat_actively/
 - ✅ QQ 戳一戳功能：已实现 aiocqhttp 平台的戳一戳功能
 
 ### 待优化
-- 暂无
+- 暂无 
 
 ## 许可证
 
-MIT License
+Apache License 2.0
 
 ## 贡献
 
-欢迎提交 Issue 和 Pull Request！
+欢迎提交 Issue 和 Pull Request！请给项目点个 star 支持一下！
 
 ## 更新日志
 
-### v1.1.0 (2026-03-10)
+### v1.1.0 (2026-03-11)
 
 **优化改进：**
 - ✅ 异常处理细化：将所有宽泛的 `Exception` 捕获替换为具体异常类型（sqlite3.Error, ValueError, TypeError, KeyError, AttributeError, RuntimeError, OSError 等）
