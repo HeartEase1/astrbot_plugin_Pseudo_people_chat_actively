@@ -17,7 +17,7 @@ class DatabaseManager:
     """数据库管理器"""
 
     # 数据库版本号
-    DB_VERSION = 1
+    DB_VERSION = 2
 
     def __init__(self, db_path: Path):
         """
@@ -232,24 +232,29 @@ class DatabaseManager:
         """迁移到版本1（初始版本，表结构已由 _create_tables 创建，无需额外操作）"""
         logger.info("[ProactiveReply] [数据库迁移] v1迁移完成：初始版本，无需额外操作")
 
-    # 迁移方法示例（未来版本使用）
-    # async def _migrate_to_v2(self):
-    #     """迁移到版本2的示例"""
-    #     def _migrate():
-    #         try:
-    #             cursor = self.conn.cursor()
-    #             # 示例：添加新字段
-    #             cursor.execute("""
-    #                 ALTER TABLE user_base_info
-    #                 ADD COLUMN new_field TEXT DEFAULT ''
-    #             """)
-    #             self.conn.commit()
-    #             logger.info("[ProactiveReply] [数据库迁移] v2迁移完成：添加新字段")
-    #         except sqlite3.Error as e:
-    #             logger.error(f"[ProactiveReply] [数据库迁移] v2迁移失败: {e}")
-    #             raise
-    #
-    #     await asyncio.to_thread(_migrate)
+    async def _migrate_to_v2(self):
+        """迁移到版本2：user_base_info 添加 last_conversation_summary_time 字段"""
+        def _migrate():
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute("""
+                    ALTER TABLE user_base_info
+                    ADD COLUMN last_conversation_summary_time INTEGER DEFAULT 0
+                """)
+                self.conn.commit()
+                logger.info("[ProactiveReply] [数据库迁移] v2迁移完成：添加 last_conversation_summary_time 字段")
+            except sqlite3.OperationalError as e:
+                if "duplicate column name" in str(e).lower():
+                    logger.info("[ProactiveReply] [数据库迁移] v2：字段已存在，跳过")
+                else:
+                    logger.error(f"[ProactiveReply] [数据库迁移] v2迁移失败: {e}")
+                    raise
+            except sqlite3.Error as e:
+                logger.error(f"[ProactiveReply] [数据库迁移] v2迁移失败: {e}")
+                raise
+
+        async with self._write_lock:
+            await asyncio.to_thread(_migrate)
 
     def _get_beijing_timestamp(self) -> int:
         """获取北京时间时间戳"""
@@ -314,6 +319,9 @@ class DatabaseManager:
         """
         def _get():
             try:
+                if not self.conn:
+                    logger.warning("[ProactiveReply] [数据库] 数据库连接已关闭，跳过获取用户信息")
+                    return None
                 cursor = self.conn.cursor()
                 cursor.execute("SELECT * FROM user_base_info WHERE user_id = ?", (user_id,))
                 row = cursor.fetchone()
@@ -545,6 +553,9 @@ class DatabaseManager:
         """获取所有用户ID列表"""
         def _get():
             try:
+                if not self.conn:
+                    logger.warning("[ProactiveReply] [数据库] 数据库连接已关闭，返回空用户列表")
+                    return []
                 cursor = self.conn.cursor()
                 cursor.execute("SELECT user_id FROM user_base_info")
                 rows = cursor.fetchall()
@@ -571,6 +582,9 @@ class DatabaseManager:
         """
         def _get():
             try:
+                if not self.conn:
+                    logger.warning("[ProactiveReply] [数据库] 数据库连接已关闭，返回消息数0")
+                    return 0
                 cursor = self.conn.cursor()
                 now = self._get_beijing_timestamp()
                 time_threshold = now - (hours * 3600)
@@ -683,6 +697,52 @@ class DatabaseManager:
 
         async with self._write_lock:
             await asyncio.to_thread(_update)
+
+    async def get_conversation_summary_cooldown(self, user_id: str) -> int:
+        """
+        获取用户对话总结冷却时间戳
+
+        Returns:
+            上次总结的时间戳，不存在返回0
+        """
+        def _get():
+            try:
+                if not self.conn:
+                    return 0
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "SELECT last_conversation_summary_time FROM user_base_info WHERE user_id = ?",
+                    (user_id,)
+                )
+                row = cursor.fetchone()
+                if row:
+                    return row[0] or 0
+                return 0
+            except sqlite3.Error as e:
+                logger.error(f"[ProactiveReply] [数据库] 获取冷却时间失败: {e}")
+                return 0
+
+        return await asyncio.to_thread(_get)
+
+    async def set_conversation_summary_cooldown(self, user_id: str, timestamp: int):
+        """更新用户对话总结冷却时间戳"""
+        def _set():
+            try:
+                if not self.conn:
+                    return
+                cursor = self.conn.cursor()
+                cursor.execute("""
+                    UPDATE user_base_info
+                    SET last_conversation_summary_time = ?
+                    WHERE user_id = ?
+                """, (timestamp, user_id))
+                self.conn.commit()
+            except sqlite3.Error as e:
+                self.conn.rollback()
+                logger.error(f"[ProactiveReply] [数据库] 更新冷却时间失败: {e}")
+
+        async with self._write_lock:
+            await asyncio.to_thread(_set)
 
     async def close(self):
         """关闭数据库连接"""

@@ -60,9 +60,6 @@ class ProactiveReplyPlugin(Star):
         # 对话结束倒计时任务字典 {user_id: asyncio.Task}
         self.conversation_timers: Dict[str, asyncio.Task] = {}
 
-        # 对话总结冷却时间记录 {user_id: timestamp}
-        self.conversation_summary_cooldown: Dict[str, float] = {}
-
         # LLM 并发控制信号量
         self._llm_semaphore = asyncio.Semaphore(5)
 
@@ -290,14 +287,7 @@ class ProactiveReplyPlugin(Star):
             self.scheduler.add_daily_task(
                 "cleanup_old_records",
                 "02:00",
-                lambda: self.db.cleanup_old_send_records(days=OLD_RECORDS_RETENTION_DAYS)
-            )
-
-            # 清理对话总结冷却时间记录（每天凌晨3点）
-            self.scheduler.add_daily_task(
-                "cleanup_summary_cooldown",
-                "03:00",
-                self._cleanup_summary_cooldown
+                self._cleanup_old_records
             )
 
             # 清理过期的对话倒计时任务（每天凌晨4点）
@@ -370,6 +360,14 @@ class ProactiveReplyPlugin(Star):
             if event.get_group_id() and not self.config.get("enable_group_proactive", False):
                 return
 
+            # 过滤机器人自身发出的消息，避免污染用户活跃状态
+            if getattr(event, 'is_self_message', False):
+                return
+            sender_id = getattr(event, 'sender_id', None) or getattr(event, 'sender', None)
+            self_id = getattr(event, 'self_id', None)
+            if sender_id and self_id and str(sender_id) == str(self_id):
+                return
+
             user_id = event.unified_msg_origin
 
             # 更新用户活跃时间
@@ -399,28 +397,12 @@ class ProactiveReplyPlugin(Star):
         except Exception as e:
             logger.error(f"[ProactiveReply] [事件监听] 处理消息事件发生未知错误: {e}")
 
-    async def _cleanup_summary_cooldown(self):
-        """清理过期的对话总结冷却时间记录"""
-        try:
-            now = self.scheduler.get_beijing_time().timestamp()
-            cooldown_seconds = CONVERSATION_SUMMARY_COOLDOWN_HOURS * 3600
-
-            # 清理超过冷却时间的记录
-            expired_users = [
-                user_id for user_id, timestamp in self.conversation_summary_cooldown.items()
-                if now - timestamp > cooldown_seconds
-            ]
-
-            for user_id in expired_users:
-                del self.conversation_summary_cooldown[user_id]
-
-            if expired_users:
-                logger.info(f"[ProactiveReply] [定时任务] 清理了{len(expired_users)}条过期的对话总结冷却记录")
-        except Exception as e:
-            logger.error(f"[ProactiveReply] [定时任务] 清理对话总结冷却记录失败: {e}")
+    async def _cleanup_old_records(self):
+        """清理旧消息发送记录（定时任务回调）"""
+        await self.db.cleanup_old_send_records(days=OLD_RECORDS_RETENTION_DAYS)
 
     async def _cleanup_conversation_timers(self):
-        """清理已完成的对话倒计时任务"""
+        """清理已完成的对话倒计时任务，同时回收无活跃用户的发送锁"""
         try:
             # 清理已完成的任务
             completed_users = [
@@ -433,6 +415,16 @@ class ProactiveReplyPlugin(Star):
 
             if completed_users:
                 logger.info(f"[ProactiveReply] [定时任务] 清理了{len(completed_users)}个已完成的对话倒计时任务")
+
+            # 回收不再有活跃计时器的用户发送锁，防止长期运行内存增长
+            active_users = set(self.conversation_timers.keys())
+            stale_lock_users = [uid for uid in list(self._send_locks.keys()) if uid not in active_users]
+            for uid in stale_lock_users:
+                lock = self._send_locks.get(uid)
+                if lock and not lock.locked():
+                    del self._send_locks[uid]
+            if stale_lock_users:
+                logger.debug(f"[ProactiveReply] [定时任务] 回收了{len(stale_lock_users)}个无活跃用户的发送锁")
         except Exception as e:
             logger.error(f"[ProactiveReply] [定时任务] 清理对话倒计时任务失败: {e}")
 
@@ -447,9 +439,9 @@ class ProactiveReplyPlugin(Star):
         try:
             await asyncio.sleep(threshold)
 
-            # 检查冷却时间
+            # 检查冷却时间（从数据库读取，重启后仍有效）
             now = self.scheduler.get_beijing_time().timestamp()
-            last_summary_time = self.conversation_summary_cooldown.get(user_id, 0)
+            last_summary_time = await self.db.get_conversation_summary_cooldown(user_id)
             cooldown_seconds = CONVERSATION_SUMMARY_COOLDOWN_HOURS * 3600
 
             if now - last_summary_time < cooldown_seconds:
@@ -459,8 +451,8 @@ class ProactiveReplyPlugin(Star):
 
             logger.info(f"[ProactiveReply] [对话判定] 用户[{user_id[:16]}...]对话结束，触发上下文总结流程")
 
-            # 记录本次总结时间
-            self.conversation_summary_cooldown[user_id] = now
+            # 持久化本次总结时间
+            await self.db.set_conversation_summary_cooldown(user_id, int(now))
 
             # 触发对话结束后的主动回复流程
             await self._handle_conversation_end(user_id)
@@ -900,17 +892,16 @@ class ProactiveReplyPlugin(Star):
                     logger.warning(f"[ProactiveReply] [消息发送] 用户[{user_id[:16]}...]触发频率限制（{MESSAGE_FREQUENCY_CHECK_HOURS}小时内已发送{recent_count}条，限制{freq_limit}条），跳过发送")
                     return False
 
-                # 先记录发送，再实际发送，确保并发下不超限
+                # QQ戳一戳功能（仅aiocqhttp平台）
+                if self.config.get("enable_qq_poke", False):
+                    await self._send_qq_poke(user_id)
+
+                # 构建并发送消息链（使用文档推荐的流式 API）
+                message_chain = MessageChain().message(message)
+                await self.context.send_message(user_id, message_chain)
+
+                # 发送成功后再记录，避免发送失败占用频控额度
                 await self.db.record_message_sent(user_id, "proactive")
-
-            # QQ戳一戳功能（仅aiocqhttp平台）
-            if self.config.get("enable_qq_poke", False):
-                await self._send_qq_poke(user_id)
-
-            # 构建并发送消息链（使用文档推荐的流式 API）
-            message_chain = MessageChain().message(message)
-
-            await self.context.send_message(user_id, message_chain)
 
             return True
 
@@ -1169,33 +1160,16 @@ class ProactiveReplyPlugin(Star):
                             logger.info(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]无事件生成")
                             return
 
-                        # 程序化校验事件间隔（MIN_EVENT_INTERVAL_HOURS），过滤/重排不满足间隔的事件
-                        validated_events = []
-                        for event in events:
-                            if not isinstance(event, dict):
-                                continue
-                            time_str = event.get("time", "")
-                            if not time_str:
-                                continue
-                            try:
-                                hour, minute = map(int, time_str.split(':'))
-                                candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-                            except (ValueError, TypeError):
-                                continue
-                            if candidate <= now:
-                                continue
-                            # 检查与已验证事件的间隔
-                            too_close = any(
-                                abs((candidate - prev).total_seconds()) < MIN_EVENT_INTERVAL_HOURS * 3600
-                                for prev in validated_events
-                            )
-                            if too_close:
-                                logger.warning(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]事件时间{time_str}与已有事件间隔不足{MIN_EVENT_INTERVAL_HOURS}小时，跳过")
-                                continue
-                            validated_events.append(candidate)
+                        # 单次遍历：校验间隔 → 防打扰调整 → 再校验 → 注册，直到达到上限
+                        registered_times = []  # 已注册事件的最终触发时间（调整后）
+                        remaining = max_event_count - event_count
+                        disturb_start = self.config.get("disturb_free_start", 0)
+                        disturb_end = self.config.get("disturb_free_end", 6)
+                        min_interval_sec = MIN_EVENT_INTERVAL_HOURS * 3600
 
-                        # 注册事件任务
-                        for event in events[:max_event_count - event_count]:
+                        for event in events:
+                            if remaining <= 0:
+                                break
                             if not isinstance(event, dict):
                                 logger.warning("[ProactiveReply] [事件生成] 事件格式错误，跳过")
                                 continue
@@ -1207,31 +1181,39 @@ class ProactiveReplyPlugin(Star):
                                 logger.warning("[ProactiveReply] [事件生成] 事件缺少必需字段，跳过")
                                 continue
 
-                            # 解析时间
                             try:
                                 hour, minute = map(int, time_str.split(':'))
                                 trigger_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
-                                # 如果时间已过，跳过
                                 if trigger_time <= now:
                                     continue
 
-                                # 跳过未通过间隔校验的事件
-                                if trigger_time not in validated_events:
+                                # 原始时间间隔校验
+                                too_close = any(
+                                    abs((trigger_time - prev).total_seconds()) < min_interval_sec
+                                    for prev in registered_times
+                                )
+                                if too_close:
+                                    logger.warning(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]事件{time_str}与已有事件间隔不足{MIN_EVENT_INTERVAL_HOURS}小时，跳过")
                                     continue
 
-                                # 避开防打扰时段
-                                disturb_start = self.config.get("disturb_free_start", 0)
-                                disturb_end = self.config.get("disturb_free_end", 6)
+                                # 防打扰时段调整
                                 trigger_time = self.scheduler.adjust_time_avoid_disturb(trigger_time, disturb_start, disturb_end)
+
+                                # 调整后再次校验间隔（调整可能导致时间挤到一起）
+                                too_close_after = any(
+                                    abs((trigger_time - prev).total_seconds()) < min_interval_sec
+                                    for prev in registered_times
+                                )
+                                if too_close_after:
+                                    logger.warning(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]事件{time_str}防打扰调整后仍与已有事件间隔不足，跳过")
+                                    continue
 
                                 # 生成任务ID
                                 task_id = f"event_{user_id}_{uuid.uuid4().hex[:8]}"
 
                                 # 保存任务，失败则跳过调度器注册
-                                task_context = {
-                                    "event_content": content
-                                }
+                                task_context = {"event_content": content}
                                 db_ok = await self.db.add_task(
                                     task_id,
                                     user_id,
@@ -1253,6 +1235,8 @@ class ProactiveReplyPlugin(Star):
                                     logger.warning(f"[ProactiveReply] [事件生成] 任务[{task_id}]调度器注册失败，跳过")
                                     continue
 
+                                registered_times.append(trigger_time)
+                                remaining -= 1
                                 logger.info(f"[ProactiveReply] [事件生成] 为用户[{user_id[:16]}...]生成日常事件任务，"
                                            f"触发时间：{trigger_time.strftime('%Y-%m-%d %H:%M')}（北京时间），"
                                            f"事件内容：{content}")

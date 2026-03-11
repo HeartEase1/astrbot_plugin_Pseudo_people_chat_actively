@@ -65,6 +65,9 @@ class TaskScheduler:
             *args, **kwargs: 回调函数参数
         """
         try:
+            if not self.is_running:
+                logger.warning(f"[ProactiveReply] [定时任务] 调度器未运行，跳过注册一次性任务[{task_id}]")
+                return False
             # 确保触发时间是北京时间
             if trigger_time.tzinfo is None:
                 trigger_time = self.beijing_tz.localize(trigger_time)
@@ -109,6 +112,9 @@ class TaskScheduler:
             *args, **kwargs: 回调函数参数
         """
         try:
+            if not self.is_running:
+                logger.warning(f"[ProactiveReply] [定时任务] 调度器未运行，跳过注册cron任务[{task_id}]")
+                return False
             # 解析cron表达式
             parts = cron_expr.split()
             if len(parts) != 5:
@@ -155,6 +161,9 @@ class TaskScheduler:
             *args, **kwargs: 回调函数参数
         """
         try:
+            if not self.is_running:
+                logger.warning(f"[ProactiveReply] [定时任务] 调度器未运行，跳过注册每日任务[{task_id}]")
+                return False
             # 解析时间
             hour, minute = map(int, time_str.split(':'))
 
