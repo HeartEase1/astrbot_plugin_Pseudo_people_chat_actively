@@ -251,14 +251,9 @@ class TaskScheduler:
         adjusted = target_time.replace(hour=end_hour, minute=0, second=0, microsecond=0)
 
         # 处理跨天情况：如果防打扰时段跨天（如 23:00-06:00）
-        if start_hour > end_hour:
-            # 如果当前时间在午夜之前（23:00-23:59），调整到第二天的结束时间
-            if target_time.hour >= start_hour:
-                adjusted = adjusted + timedelta(days=1)
-        else:
-            # 正常情况：如果调整后的时间早于原时间，说明出错了，使用原日期
-            if adjusted < target_time:
-                adjusted = target_time.replace(hour=end_hour, minute=0, second=0, microsecond=0)
+        if start_hour > end_hour and target_time.hour >= start_hour:
+            # 当前时间在午夜之前（如 23:xx），结束时间在第二天
+            adjusted = adjusted + timedelta(days=1)
 
         logger.info(f"[ProactiveReply] [时间校验] 触发时间落在防打扰时段，"
                    f"已顺延至{adjusted.strftime('%Y-%m-%d %H:%M')}（北京时间）")

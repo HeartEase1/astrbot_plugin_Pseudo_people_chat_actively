@@ -5,17 +5,17 @@ AstrBot 智能主动回复插件
 import asyncio
 import uuid
 import random
-import os
+import json
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Any, Optional
 
 from astrbot.api import logger
 from astrbot.api.star import Context, Star
-from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api import AstrBotConfig
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
-import astrbot.api.message_components as Comp
 
 from .database import DatabaseManager
 from .scheduler import TaskScheduler
@@ -52,9 +52,8 @@ class ProactiveReplyPlugin(Star):
         # 验证配置
         self._validate_config()
 
-        # 初始化数据库
-        data_path = get_astrbot_data_path()
-        plugin_data_path = Path(data_path) / "plugin_data" / "proactive_reply"
+        # 初始化数据库（使用文档推荐的 self.name 作为插件数据目录名）
+        plugin_data_path = Path(get_astrbot_data_path()) / "plugin_data" / self.name
         db_path = plugin_data_path / "proactive_reply.db"
         self.db = DatabaseManager(db_path)
 
@@ -70,8 +69,8 @@ class ProactiveReplyPlugin(Star):
         # 初始化状态标志
         self._initialized = False
 
-        # 启动初始化任务
-        self._init_task = asyncio.create_task(self._async_init())
+        # 直接调度异步初始化，兼容插件重载场景
+        asyncio.create_task(self._async_init())
 
         logger.info("[ProactiveReply] [插件初始化] 插件初始化完成")
 
@@ -294,24 +293,19 @@ class ProactiveReplyPlugin(Star):
                     expired_count += 1
                     continue
 
-                # 检查任务是否已在调度器中
-                from apscheduler.jobstores.base import JobLookupError
-                try:
-                    self.scheduler.scheduler.get_job(task['task_id'])
+                # 检查任务是否已在调度器中（get_job 不存在时返回 None）
+                if self.scheduler.scheduler.get_job(task['task_id']) is not None:
                     logger.debug(f"[ProactiveReply] [插件初始化] 任务[{task['task_id']}]已存在，跳过")
                     continue
-                except JobLookupError:
-                    # 任务不存在，可以注册
-                    pass
 
                 # 恢复任务
-                self.scheduler.add_one_time_task(
+                if self.scheduler.add_one_time_task(
                     task['task_id'],
                     trigger_time,
                     self._execute_task,
                     task['task_id']
-                )
-                restored_count += 1
+                ):
+                    restored_count += 1
 
             logger.info(f"[ProactiveReply] [插件初始化] 任务恢复完成，恢复{restored_count}个任务，过期{expired_count}个任务")
         except (ValueError, KeyError, TypeError) as e:
@@ -335,8 +329,8 @@ class ProactiveReplyPlugin(Star):
             if not self.config.get("enable_plugin", True):
                 return
 
-            # 检查是否是群聊消息
-            if event.message_obj.group_id and not self.config.get("enable_group_proactive", False):
+            # 检查是否是群聊消息（使用文档推荐的 get_group_id 方法）
+            if event.get_group_id() and not self.config.get("enable_group_proactive", False):
                 return
 
             user_id = event.unified_msg_origin
@@ -346,7 +340,11 @@ class ProactiveReplyPlugin(Star):
 
             logger.info(f"[ProactiveReply] [事件监听] 收到用户[{user_id[:16]}...]的消息，启动对话结束倒计时")
 
-            # 取消之前的倒计时
+            # 取消之前的倒计时，同时清理已完成的任务避免内存膨胀
+            done_users = [uid for uid, t in self.conversation_timers.items() if t.done()]
+            for uid in done_users:
+                del self.conversation_timers[uid]
+
             if user_id in self.conversation_timers:
                 self.conversation_timers[user_id].cancel()
 
@@ -492,21 +490,11 @@ class ProactiveReplyPlugin(Star):
                 return
 
             # 2. 生成对话总结
-            # 注意：conversation.history 可能是字符串或列表格式
-            history = conversation.history
+            # 文档明确 conversation.history 是 str 类型
+            history_text = conversation.history
 
-            # 处理不同的历史格式
-            if isinstance(history, list):
-                # 如果是列表，转换为字符串
-                history_text = "\n".join([
-                    f"{msg.get('role', 'user')}: {msg.get('content', '')}"
-                    for msg in history if isinstance(msg, dict)
-                ])
-            elif isinstance(history, str):
-                # 如果已经是字符串，直接使用
-                history_text = history
-            else:
-                logger.warning(f"[ProactiveReply] [上下文处理] 未知的对话历史格式: {type(history)}")
+            if not history_text or not history_text.strip():
+                logger.warning(f"[ProactiveReply] [上下文处理] 用户[{user_id[:16]}...]对话历史为空，跳过")
                 return
 
             summary = await self._generate_conversation_summary(user_id, history_text)
@@ -628,9 +616,6 @@ class ProactiveReplyPlugin(Star):
                 return None
 
             # 解析 JSON 响应
-            import json
-            import re
-
             # 尝试提取 JSON
             json_match = re.search(r'\{.*\}', llm_resp.completion_text, re.DOTALL)
             if json_match:
@@ -666,9 +651,6 @@ class ProactiveReplyPlugin(Star):
 
             return None
 
-        except asyncio.TimeoutError:
-            logger.error(f"[ProactiveReply] [LLM决策] LLM调用超时")
-            return None
         except (json.JSONDecodeError, ValueError, KeyError) as e:
             logger.error(f"[ProactiveReply] [LLM决策] 决策失败: {e}")
             return None
@@ -729,12 +711,13 @@ class ProactiveReplyPlugin(Star):
             )
 
             # 注册到调度器
-            self.scheduler.add_one_time_task(
+            if not self.scheduler.add_one_time_task(
                 task_id,
                 trigger_time,
                 self._execute_task,
                 task_id
-            )
+            ):
+                logger.warning(f"[ProactiveReply] [任务注册] 任务[{task_id}]调度器注册失败，已保存到数据库待下次恢复")
 
         except (ValueError, KeyError, TypeError) as e:
             logger.error(f"[ProactiveReply] [任务注册] 注册任务失败: {e}")
@@ -806,7 +789,7 @@ class ProactiveReplyPlugin(Star):
 
             # 获取人设
             persona_mgr = self.context.persona_manager
-            persona = persona_mgr.get_default_persona_v3(umo=user_id)
+            persona = await persona_mgr.get_default_persona_v3(umo=user_id)
             persona_prompt = persona.prompt if persona and hasattr(persona, 'prompt') else ""
 
             # 构建提示词
@@ -818,20 +801,34 @@ class ProactiveReplyPlugin(Star):
 
 请生成一条简短、自然的主动消息（不超过50字）。"""
 
-            # 调用 LLM（添加超时控制）
+            # 调用 LLM，失败最多重试2次
             provider_id = await self.context.get_current_chat_provider_id(umo=user_id)
-            try:
-                llm_resp = await asyncio.wait_for(
-                    self.context.llm_generate(
-                        chat_provider_id=provider_id,
-                        prompt=prompt
-                    ),
-                    timeout=LLM_TIMEOUT_SECONDS
-                )
-                return llm_resp.completion_text.strip()
-            except asyncio.TimeoutError:
-                logger.error(f"[ProactiveReply] [消息生成] LLM调用超时（{LLM_TIMEOUT_SECONDS}秒）")
-                return None
+            max_retries = 2
+            for attempt in range(max_retries + 1):
+                try:
+                    llm_resp = await asyncio.wait_for(
+                        self.context.llm_generate(
+                            chat_provider_id=provider_id,
+                            prompt=prompt
+                        ),
+                        timeout=LLM_TIMEOUT_SECONDS
+                    )
+                    return llm_resp.completion_text.strip()
+                except asyncio.TimeoutError:
+                    logger.warning(f"[ProactiveReply] [消息生成] LLM调用超时（第{attempt + 1}次，{LLM_TIMEOUT_SECONDS}秒）")
+                    if attempt < max_retries:
+                        await asyncio.sleep(2)
+                    else:
+                        logger.error(f"[ProactiveReply] [消息生成] LLM调用超时，已重试{max_retries}次，放弃")
+                        return None
+                except Exception as llm_err:
+                    logger.warning(f"[ProactiveReply] [消息生成] LLM调用失败（第{attempt + 1}次）: {llm_err}")
+                    if attempt < max_retries:
+                        await asyncio.sleep(2)
+                    else:
+                        logger.error(f"[ProactiveReply] [消息生成] LLM调用失败，已重试{max_retries}次，放弃")
+                        return None
+            return None
 
         except (AttributeError, KeyError) as e:
             logger.error(f"[ProactiveReply] [消息生成] 生成消息失败: {e}")
@@ -861,13 +858,8 @@ class ProactiveReplyPlugin(Star):
             if self.config.get("enable_qq_poke", False):
                 await self._send_qq_poke(user_id)
 
-            # 构建消息链
-            chain = [Comp.Plain(message)]
-
-            # 发送消息
-            from astrbot.api.event import MessageChain
-            message_chain = MessageChain()
-            message_chain.chain = chain
+            # 构建并发送消息链（使用文档推荐的流式 API）
+            message_chain = MessageChain().message(message)
 
             await self.context.send_message(user_id, message_chain)
 
@@ -905,21 +897,23 @@ class ProactiveReplyPlugin(Star):
 
             qq_number = parts[-1]
 
-            # 尝试调用戳一戳API
+            # 通过文档推荐的 platform_manager 获取 aiocqhttp 平台实例
             try:
-                # 获取平台实例
-                platform = self.context.get_platform_by_umo(user_id)
-                if not platform:
-                    logger.warning(f"[ProactiveReply] [戳一戳] 无法获取平台实例")
+                from astrbot.api.platform import AiocqhttpAdapter
+                platforms = self.context.platform_manager.get_insts()
+                aiocqhttp_platform = None
+                for p in platforms:
+                    if isinstance(p, AiocqhttpAdapter):
+                        aiocqhttp_platform = p
+                        break
+
+                if not aiocqhttp_platform:
+                    logger.debug(f"[ProactiveReply] [戳一戳] 未找到 aiocqhttp 平台实例，跳过戳一戳")
                     return
 
-                # 检查平台是否支持戳一戳
-                if not hasattr(platform, 'call_platform_api'):
-                    logger.debug(f"[ProactiveReply] [戳一戳] 平台不支持API调用")
-                    return
-
-                # 调用戳一戳API
-                await platform.call_platform_api(
+                # 通过文档推荐的 client.api.call_action 调用协议端 API
+                client = aiocqhttp_platform.get_client()
+                await client.api.call_action(
                     "send_private_poke",
                     user_id=int(qq_number)
                 )
@@ -1022,12 +1016,14 @@ class ProactiveReplyPlugin(Star):
                     )
 
                     # 注册到调度器
-                    self.scheduler.add_one_time_task(
+                    if not self.scheduler.add_one_time_task(
                         task_id,
                         trigger_time,
                         self._execute_greeting_task,
                         task_id
-                    )
+                    ):
+                        logger.warning(f"[ProactiveReply] [问候计划] 任务[{task_id}]调度器注册失败，跳过")
+                        continue
 
                     generated_count += 1
                     logger.info(f"[ProactiveReply] [问候计划] 为用户[{user_id[:16]}...]生成日常问候任务，"
@@ -1097,8 +1093,6 @@ class ProactiveReplyPlugin(Star):
                         continue
 
                     # 解析 JSON
-                    import json
-                    import re
                     json_match = re.search(r'\{.*\}', llm_resp.completion_text, re.DOTALL)
                     if not json_match:
                         logger.warning(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]事件生成失败：无法解析JSON")
@@ -1167,12 +1161,14 @@ class ProactiveReplyPlugin(Star):
                             )
 
                             # 注册到调度器
-                            self.scheduler.add_one_time_task(
+                            if not self.scheduler.add_one_time_task(
                                 task_id,
                                 trigger_time,
                                 self._execute_event_task,
                                 task_id
-                            )
+                            ):
+                                logger.warning(f"[ProactiveReply] [事件生成] 任务[{task_id}]调度器注册失败，跳过")
+                                continue
 
                             logger.info(f"[ProactiveReply] [事件生成] 为用户[{user_id[:16]}...]生成日常事件任务，"
                                        f"触发时间：{trigger_time.strftime('%Y-%m-%d %H:%M')}（北京时间），"
@@ -1224,7 +1220,7 @@ class ProactiveReplyPlugin(Star):
 
                             # 获取人设
                             persona_mgr = self.context.persona_manager
-                            persona = persona_mgr.get_default_persona_v3(umo=user_id)
+                            persona = await persona_mgr.get_default_persona_v3(umo=user_id)
                             persona_prompt = persona.prompt if persona and hasattr(persona, 'prompt') else ""
 
                             prompt = f"""请基于角色人设，生成一条自然的问候/关心消息，因为用户已经1天没有和你聊天了。
@@ -1277,7 +1273,7 @@ class ProactiveReplyPlugin(Star):
 
                             # 获取人设
                             persona_mgr = self.context.persona_manager
-                            persona = persona_mgr.get_default_persona_v3(umo=user_id)
+                            persona = await persona_mgr.get_default_persona_v3(umo=user_id)
                             persona_prompt = persona.prompt if persona and hasattr(persona, 'prompt') else ""
 
                             prompt = f"""请基于角色人设，生成一条带点生气、质问语气的消息，因为用户已经超过6天没有和你聊天了。
@@ -1354,7 +1350,7 @@ class ProactiveReplyPlugin(Star):
 
                 # 获取人设
                 persona_mgr = self.context.persona_manager
-                persona = persona_mgr.get_default_persona_v3(umo=user_id)
+                persona = await persona_mgr.get_default_persona_v3(umo=user_id)
                 persona_prompt = persona.prompt if persona and hasattr(persona, 'prompt') else ""
 
                 prompt = f"""请基于角色人设，生成一条{time_range}的日常问候消息。
@@ -1372,39 +1368,53 @@ class ProactiveReplyPlugin(Star):
 直接输出消息内容，不要有其他说明。"""
 
                 try:
-                    llm_resp = await asyncio.wait_for(
-                        self.context.llm_generate(
-                            chat_provider_id=provider_id,
-                            prompt=prompt
-                        ),
-                        timeout=LLM_TIMEOUT_SECONDS
-                    )
-                except asyncio.TimeoutError:
-                    logger.error(f"[ProactiveReply] [任务执行] 问候任务LLM调用超时（{LLM_TIMEOUT_SECONDS}秒）")
-                    await self.db.update_task_status(task_id, 2, "LLM调用超时")
-                    return
+                    llm_resp = None
+                    max_retries = 2
+                    for attempt in range(max_retries + 1):
+                        try:
+                            llm_resp = await asyncio.wait_for(
+                                self.context.llm_generate(
+                                    chat_provider_id=provider_id,
+                                    prompt=prompt
+                                ),
+                                timeout=LLM_TIMEOUT_SECONDS
+                            )
+                            break
+                        except asyncio.TimeoutError:
+                            logger.warning(f"[ProactiveReply] [任务执行] 问候任务LLM调用超时（第{attempt + 1}次）")
+                            if attempt < max_retries:
+                                await asyncio.sleep(2)
+                        except Exception as llm_err:
+                            logger.warning(f"[ProactiveReply] [任务执行] 问候任务LLM调用失败（第{attempt + 1}次）: {llm_err}")
+                            if attempt < max_retries:
+                                await asyncio.sleep(2)
 
-                message = llm_resp.completion_text.strip()
+                    if not llm_resp:
+                        logger.error(f"[ProactiveReply] [任务执行] 问候任务LLM调用失败，已重试{max_retries}次，放弃")
+                        await self.db.update_task_status(task_id, 2, "LLM调用失败")
+                        return
 
-                # 发送消息
-                success = await self._send_proactive_message(user_id, message)
+                    message = llm_resp.completion_text.strip()
 
-                if success:
-                    await self.db.update_task_status(task_id, 1)
-                    await self.db.increment_greeting_count(user_id)
-                    logger.info(f"[ProactiveReply] [消息发送] 用户[{user_id[:16]}...]的问候任务执行成功")
-                else:
-                    await self.db.update_task_status(task_id, 2, "消息发送失败")
+                    # 发送消息
+                    success = await self._send_proactive_message(user_id, message)
 
-            except asyncio.TimeoutError:
-                logger.error(f"[ProactiveReply] [任务执行] 问候任务LLM调用超时")
-                await self.db.update_task_status(task_id, 2, "LLM调用超时")
-            except (AttributeError, KeyError) as e:
-                logger.error(f"[ProactiveReply] [任务执行] 问候任务执行失败: {e}")
-                await self.db.update_task_status(task_id, 2, str(e))
+                    if success:
+                        await self.db.update_task_status(task_id, 1)
+                        await self.db.increment_greeting_count(user_id)
+                        logger.info(f"[ProactiveReply] [消息发送] 用户[{user_id[:16]}...]的问候任务执行成功")
+                    else:
+                        await self.db.update_task_status(task_id, 2, "消息发送失败")
 
-        except (KeyError, TypeError) as e:
-            logger.error(f"[ProactiveReply] [任务执行] 执行问候任务失败: {e}")
+                except (AttributeError, KeyError) as e:
+                    logger.error(f"[ProactiveReply] [任务执行] 问候任务执行失败: {e}")
+                    await self.db.update_task_status(task_id, 2, str(e))
+
+            except (KeyError, TypeError) as e:
+                logger.error(f"[ProactiveReply] [任务执行] 执行问候任务失败: {e}")
+
+        except Exception as e:
+            logger.error(f"[ProactiveReply] [任务执行] 执行问候任务发生未知错误: {e}")
 
     async def _execute_event_task(self, task_id: str):
         """
@@ -1435,7 +1445,7 @@ class ProactiveReplyPlugin(Star):
 
                 # 获取人设
                 persona_mgr = self.context.persona_manager
-                persona = persona_mgr.get_default_persona_v3(umo=user_id)
+                persona = await persona_mgr.get_default_persona_v3(umo=user_id)
                 persona_prompt = persona.prompt if persona and hasattr(persona, 'prompt') else ""
 
                 prompt = f"""请基于角色人设，以这件事为话题，生成一条自然的主动消息发给用户。
@@ -1453,39 +1463,53 @@ class ProactiveReplyPlugin(Star):
 直接输出消息内容，不要有其他说明。"""
 
                 try:
-                    llm_resp = await asyncio.wait_for(
-                        self.context.llm_generate(
-                            chat_provider_id=provider_id,
-                            prompt=prompt
-                        ),
-                        timeout=LLM_TIMEOUT_SECONDS
-                    )
-                except asyncio.TimeoutError:
-                    logger.error(f"[ProactiveReply] [任务执行] 事件任务LLM调用超时（{LLM_TIMEOUT_SECONDS}秒）")
-                    await self.db.update_task_status(task_id, 2, "LLM调用超时")
-                    return
+                    llm_resp = None
+                    max_retries = 2
+                    for attempt in range(max_retries + 1):
+                        try:
+                            llm_resp = await asyncio.wait_for(
+                                self.context.llm_generate(
+                                    chat_provider_id=provider_id,
+                                    prompt=prompt
+                                ),
+                                timeout=LLM_TIMEOUT_SECONDS
+                            )
+                            break
+                        except asyncio.TimeoutError:
+                            logger.warning(f"[ProactiveReply] [任务执行] 事件任务LLM调用超时（第{attempt + 1}次）")
+                            if attempt < max_retries:
+                                await asyncio.sleep(2)
+                        except Exception as llm_err:
+                            logger.warning(f"[ProactiveReply] [任务执行] 事件任务LLM调用失败（第{attempt + 1}次）: {llm_err}")
+                            if attempt < max_retries:
+                                await asyncio.sleep(2)
 
-                message = llm_resp.completion_text.strip()
+                    if not llm_resp:
+                        logger.error(f"[ProactiveReply] [任务执行] 事件任务LLM调用失败，已重试{max_retries}次，放弃")
+                        await self.db.update_task_status(task_id, 2, "LLM调用失败")
+                        return
 
-                # 发送消息
-                success = await self._send_proactive_message(user_id, message)
+                    message = llm_resp.completion_text.strip()
 
-                if success:
-                    await self.db.update_task_status(task_id, 1)
-                    await self.db.increment_event_count(user_id)
-                    logger.info(f"[ProactiveReply] [消息发送] 用户[{user_id[:16]}...]的事件任务执行成功")
-                else:
-                    await self.db.update_task_status(task_id, 2, "消息发送失败")
+                    # 发送消息
+                    success = await self._send_proactive_message(user_id, message)
 
-            except asyncio.TimeoutError:
-                logger.error(f"[ProactiveReply] [任务执行] 事件任务LLM调用超时")
-                await self.db.update_task_status(task_id, 2, "LLM调用超时")
-            except (AttributeError, KeyError) as e:
-                logger.error(f"[ProactiveReply] [任务执行] 事件任务执行失败: {e}")
-                await self.db.update_task_status(task_id, 2, str(e))
+                    if success:
+                        await self.db.update_task_status(task_id, 1)
+                        await self.db.increment_event_count(user_id)
+                        logger.info(f"[ProactiveReply] [消息发送] 用户[{user_id[:16]}...]的事件任务执行成功")
+                    else:
+                        await self.db.update_task_status(task_id, 2, "消息发送失败")
 
-        except (KeyError, TypeError) as e:
-            logger.error(f"[ProactiveReply] [任务执行] 执行事件任务失败: {e}")
+                except (AttributeError, KeyError) as e:
+                    logger.error(f"[ProactiveReply] [任务执行] 事件任务执行失败: {e}")
+                    await self.db.update_task_status(task_id, 2, str(e))
+
+            except (KeyError, TypeError) as e:
+                logger.error(f"[ProactiveReply] [任务执行] 执行事件任务失败: {e}")
+
+        except Exception as e:
+            logger.error(f"[ProactiveReply] [任务执行] 执行事件任务发生未知错误: {e}")
 
     async def terminate(self):
         """插件卸载时调用"""

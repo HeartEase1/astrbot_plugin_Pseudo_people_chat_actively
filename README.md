@@ -109,7 +109,7 @@
 |--------|------|--------|------|
 | enable_group_proactive | bool | false | 是否开启群聊场景主动回复 |
 | qq_msg_frequency_limit | int | 2 | 单个用户1小时内最多接收的主动消息条数（每个用户独立计算） |
-| enable_qq_poke | bool | false | 主动消息发送前是否触发QQ戳一戳（功能未实现） |
+| enable_qq_poke | bool | false | 主动消息发送前是否触发QQ戳一戳（仅aiocqhttp平台） |
 
 ## 使用示例
 
@@ -162,7 +162,7 @@ AI: 喂！你是不是把我忘了？都6天没理我了！
 - **日常事件**：事件内容、触发时间、执行状态
 - **消息发送记录**：用于频率限制控制
 
-数据库文件位置：`data/plugin_data/proactive_reply/proactive_reply.db`
+数据库文件位置：`data/plugin_data/{插件名称}/proactive_reply.db`（插件名称为metadata.yaml中的name字段）
 
 ### 定时任务
 
@@ -266,9 +266,11 @@ astrbot_plugin_Pseudo_people_chat_actively/
 - **异步架构**：所有数据库操作使用 `asyncio.to_thread` 异步化
 - **超时控制**：LLM 调用添加 100 秒超时限制
 - **配置验证**：启动时验证所有配置项，自动修正无效值
-- **内存管理**：插件卸载时自动清理所有对话倒计时任务
+- **内存管理**：插件卸载时自动清理所有对话倒计时任务，消息处理时实时清理已完成任务
 - **错误处理**：完善的异常捕获和日志记录
 - **时区处理**：强制使用 pytz 的 Asia/Shanghai 时区
+- **数据库优化**：启用 WAL 模式提高并发性能
+- **LLM 可靠性**：添加 LLM 调用重试机制（最多2次）
 
 ### API 使用规范
 
@@ -294,19 +296,25 @@ astrbot_plugin_Pseudo_people_chat_actively/
 - ✅ 数据库同步阻塞：所有数据库操作已使用异步方式
 - ✅ LLM 调用超时：已添加100秒超时控制
 - ✅ JSON 解析验证：已添加完整的字段验证
-- ✅ 内存泄漏风险：已添加 `conversation_timers` 清理机制
-- ✅ 任务恢复逻辑：已优化异常捕获，使用 `JobLookupError`
+- ✅ 内存泄漏风险：已添加 `conversation_timers` 清理机制，消息处理时实时清理
+- ✅ 任务恢复逻辑：已修复 get_job 逻辑，使用 `is not None` 替代错误的 try/except
 - ✅ 频率限制实现：QQ 平台频率限制已完整实现
 - ✅ 配置验证完善：已添加时间格式和时段配置验证
 - ✅ 对话历史解析：已适配 AstrBot 的字符串格式对话历史
 - ✅ 异常处理细化：已将宽泛的 `Exception` 替换为具体异常类型
 - ✅ 数据库迁移机制：已实现版本化迁移系统，支持平滑升级
 - ✅ QQ 戳一戳功能：已实现 aiocqhttp 平台的戳一戳功能
+- ✅ 导入位置优化：修复了导入顺序和不必要的导入
+- ✅ MessageChain 构建：使用流式 API 构建消息链
+- ✅ 群聊检测：使用 `event.get_group_id()` 正确检测群聊消息
+- ✅ 异步初始化：添加 `@filter.on_astrbot_loaded()` 钩子进行异步初始化
 
 ### 待优化
 - 群聊场景优化：当前群聊场景下 user_id 处理可能不够完善，建议后续优化为 `group_id + user_id` 组合
 - 数据库连接健康检查：虽然检查了 `if not self.conn`，但无法检测连接是否已关闭，建议后续添加连接健康检查
-- 配置验证增强：`greeting_probabilities` 可以添加总和验证，确保概率值合理 
+- 配置验证增强：`greeting_probabilities` 可以添加总和验证，确保概率值合理
+- 任务优先级机制：实现任务优先级，确保重要任务优先执行
+- 缓存机制：添加缓存机制，减少重复的数据库查询和 LLM 调用 
 
 ## 许可证
 
@@ -317,6 +325,33 @@ Apache License 2.0
 欢迎提交 Issue 和 Pull Request！请给项目点个 star 支持一下！
 
 ## 更新日志
+
+### v1.3.0 (2026-03-11)
+
+**重大修复：**
+- 🔴 修复 get_job 逻辑错误：将错误的 try/except JobLookupError 改为正确的 `is not None` 检查
+- 🔴 修复重复的 asyncio.TimeoutError 处理：移除冗余的异常捕获
+- 🔴 修复插件数据目录：使用 `self.name` 作为插件数据目录名，避免硬编码
+- 🔴 修复 MessageChain 构建：使用 AstrBot 推荐的流式 API `MessageChain().message(message)`
+- 🔴 修复 QQ 戳一戳 API：使用 `platform_manager + client.api.call_action` 正确调用
+- 🔴 修复对话历史格式处理：移除不必要的 isinstance 检查，直接使用字符串格式
+- 🔴 修复群聊检测：使用 `event.get_group_id()` 正确检测群聊消息
+
+**优化改进：**
+- ✅ 添加 @filter.on_astrbot_loaded() 钩子：使用推荐的异步初始化时机
+- ✅ 启用数据库 WAL 模式：提高并发性能和可靠性
+- ✅ 添加 LLM 重试机制：最多重试2次，提高消息生成成功率
+- ✅ 优化内存清理：在 on_message 中实时清理已完成的对话倒计时任务
+- ✅ 优化导入位置：调整导入顺序，移除不必要的导入
+
+**技术细节：**
+- 任务存在检查：使用 `self.scheduler.scheduler.get_job(task_id) is not None` 替代 try/except
+- 消息链构建：从手动 `.chain` 赋值改为流式 API
+- 戳一戳实现：使用 `platform_manager.get_insts()` 获取平台实例，`client.api.call_action` 调用
+- 初始化时机：使用 `@filter.on_astrbot_loaded()` 装饰器进行异步初始化
+- 数据库优化：在初始化时启用 WAL 模式
+- LLM 可靠性：在 `_generate_proactive_message` 中实现重试逻辑
+- 内存管理：在消息处理时清理已完成的任务，防止内存泄漏
 
 ### v1.2.0 (2026-03-11)
 

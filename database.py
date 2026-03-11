@@ -38,9 +38,11 @@ class DatabaseManager:
             # 确保目录存在
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # 连接数据库
+            # 连接数据库，启用 WAL 模式提升并发写入性能，降低锁竞争
             self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
             self.conn.row_factory = sqlite3.Row
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=NORMAL")
 
             # 创建表
             await self._create_tables()
@@ -224,6 +226,10 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"[ProactiveReply] [数据库迁移] 数据库迁移发生未知错误: {e}")
             raise
+
+    async def _migrate_to_v1(self):
+        """迁移到版本1（初始版本，表结构已由 _create_tables 创建，无需额外操作）"""
+        logger.info("[ProactiveReply] [数据库迁移] v1迁移完成：初始版本，无需额外操作")
 
     # 迁移方法示例（未来版本使用）
     # async def _migrate_to_v2(self):
