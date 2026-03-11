@@ -69,13 +69,42 @@ class ProactiveReplyPlugin(Star):
         # 初始化状态标志
         self._initialized = False
 
-        # 直接调度异步初始化，兼容插件重载场景
-        asyncio.create_task(self._async_init())
+        # 直接调度异步初始化，兼容插件重载场景；保留强引用防止被 GC 提前回收
+        self._init_task = asyncio.create_task(self._async_init())
 
         logger.info("[ProactiveReply] [插件初始化] 插件初始化完成")
 
     def _validate_config(self):
-        """验证配置项"""
+        """验证配置项，并在验证前预填所有默认值，确保业务逻辑可直接用 self.config['key']"""
+        # 预填默认值：所有配置键在此统一声明，业务代码无需再携带硬编码默认值
+        _DEFAULTS = {
+            "enable_plugin": True,
+            "enable_group_proactive": False,
+            "enable_qq_poke": False,
+            "enable_inactive_1d_touch": True,
+            "enable_inactive_6d_touch": True,
+            "disturb_free_start": 0,
+            "disturb_free_end": 6,
+            "greeting_probabilities": [0.6, 0.2, 0.0],
+            "daily_max_greeting_count": 2,
+            "daily_max_event_count": 2,
+            "qq_msg_frequency_limit": 2,
+            "conversation_end_threshold": 10,
+            "proactive_msg_min_interval": 2,
+            "conversation_summary_max_limit": 20,
+            "inactive_scan_time": "08:00",
+            "daily_event_generate_time": "01:00",
+            "daily_greeting_plan_time": "00:30",
+            "greeting_time_ranges": [
+                {"name": "早间", "start": 6, "end": 8},
+                {"name": "午间", "start": 12, "end": 12},
+                {"name": "晚间", "start": 18, "end": 20},
+            ],
+        }
+        for key, default in _DEFAULTS.items():
+            if key not in self.config:
+                self.config[key] = default
+
         try:
             # 验证防打扰时段
             disturb_start = self.config.get("disturb_free_start", 0)
@@ -253,7 +282,7 @@ class ProactiveReplyPlugin(Star):
         """注册全局定时任务"""
         try:
             # 每日问候计划生成
-            greeting_time = self.config.get("daily_greeting_plan_time", "00:30")
+            greeting_time = self.config["daily_greeting_plan_time"]
             self.scheduler.add_daily_task(
                 "daily_greeting_plan",
                 greeting_time,
@@ -261,7 +290,7 @@ class ProactiveReplyPlugin(Star):
             )
 
             # 每日事件生成
-            event_time = self.config.get("daily_event_generate_time", "01:00")
+            event_time = self.config["daily_event_generate_time"]
             self.scheduler.add_daily_task(
                 "daily_event_generate",
                 event_time,
@@ -269,7 +298,7 @@ class ProactiveReplyPlugin(Star):
             )
 
             # 未活跃用户扫描
-            scan_time = self.config.get("inactive_scan_time", "08:00")
+            scan_time = self.config["inactive_scan_time"]
             self.scheduler.add_daily_task(
                 "inactive_user_scan",
                 scan_time,
@@ -353,11 +382,11 @@ class ProactiveReplyPlugin(Star):
                 return
 
             # 检查插件是否启用
-            if not self.config.get("enable_plugin", True):
+            if not self.config["enable_plugin"]:
                 return
 
             # 检查是否是群聊消息（使用文档推荐的 get_group_id 方法）
-            if event.get_group_id() and not self.config.get("enable_group_proactive", False):
+            if event.get_group_id() and not self.config["enable_group_proactive"]:
                 return
 
             # 过滤机器人自身发出的消息，避免污染用户活跃状态
@@ -387,7 +416,7 @@ class ProactiveReplyPlugin(Star):
             await self._cancel_user_conversation_tasks(user_id)
 
             # 启动新的倒计时
-            threshold = self.config.get("conversation_end_threshold", 10) * 60  # 转换为秒
+            threshold = self.config["conversation_end_threshold"] * 60  # 转换为秒
             self.conversation_timers[user_id] = asyncio.create_task(
                 self._conversation_end_timer(user_id, threshold)
             )
@@ -568,7 +597,7 @@ class ProactiveReplyPlugin(Star):
                 return None
 
             # 限制历史长度（按字符数）
-            max_chars = self.config.get("conversation_summary_max_limit", 20) * 100  # 每条消息约100字符
+            max_chars = self.config["conversation_summary_max_limit"] * 100  # 每条消息约100字符
             if len(history) > max_chars:
                 history = history[-max_chars:]  # 取最后N字符
 
@@ -706,8 +735,8 @@ class ProactiveReplyPlugin(Star):
             trigger_time = self.scheduler.beijing_tz.localize(trigger_time)
 
             # 时间校验：避开防打扰时段
-            disturb_start = self.config.get("disturb_free_start", 0)
-            disturb_end = self.config.get("disturb_free_end", 6)
+            disturb_start = self.config["disturb_free_start"]
+            disturb_end = self.config["disturb_free_end"]
             trigger_time = self.scheduler.adjust_time_avoid_disturb(trigger_time, disturb_start, disturb_end)
 
             # 时间校验：检查与已有任务的间隔
@@ -717,7 +746,7 @@ class ProactiveReplyPlugin(Star):
                 for task in existing_tasks
             ]
 
-            min_interval = self.config.get("proactive_msg_min_interval", 2)
+            min_interval = self.config["proactive_msg_min_interval"]
             trigger_time = self.scheduler.check_task_interval(trigger_time, existing_times, min_interval)
 
             # 再次检查防打扰时段（因为间隔调整可能导致时间落入防打扰时段）
@@ -885,7 +914,7 @@ class ProactiveReplyPlugin(Star):
 
             async with send_lock:
                 # 检查频率限制
-                freq_limit = self.config.get("qq_msg_frequency_limit", 2)
+                freq_limit = self.config["qq_msg_frequency_limit"]
                 recent_count = await self.db.get_recent_message_count(user_id, hours=MESSAGE_FREQUENCY_CHECK_HOURS)
 
                 if recent_count >= freq_limit:
@@ -893,7 +922,7 @@ class ProactiveReplyPlugin(Star):
                     return False
 
                 # QQ戳一戳功能（仅aiocqhttp平台）
-                if self.config.get("enable_qq_poke", False):
+                if self.config["enable_qq_poke"]:
                     await self._send_qq_poke(user_id)
 
                 # 构建并发送消息链（使用文档推荐的流式 API）
@@ -978,12 +1007,8 @@ class ProactiveReplyPlugin(Star):
 
             # 获取所有用户
             users = await self.db.get_all_users()
-            time_ranges = self.config.get("greeting_time_ranges", [
-                {"name": "早间", "start": 6, "end": 8},
-                {"name": "午间", "start": 12, "end": 12},
-                {"name": "晚间", "start": 18, "end": 20}
-            ])
-            probabilities = self.config.get("greeting_probabilities", [0.6, 0.2, 0.0])
+            time_ranges = self.config["greeting_time_ranges"]
+            probabilities = self.config["greeting_probabilities"]
 
             for user_id in users:
                 user_info = await self.db.get_user_info(user_id)
@@ -992,7 +1017,7 @@ class ProactiveReplyPlugin(Star):
 
                 # 检查今日问候次数
                 greeting_count = user_info.get('today_greeting_count', 0)
-                max_count = self.config.get("daily_max_greeting_count", 2)
+                max_count = self.config["daily_max_greeting_count"]
 
                 if greeting_count >= max_count:
                     logger.debug(f"[ProactiveReply] [问候计划] 用户[{user_id[:16]}...]今日问候次数已达上限，跳过")
@@ -1032,8 +1057,8 @@ class ProactiveReplyPlugin(Star):
                         continue
 
                     # 避开防打扰时段
-                    disturb_start = self.config.get("disturb_free_start", 0)
-                    disturb_end = self.config.get("disturb_free_end", 6)
+                    disturb_start = self.config["disturb_free_start"]
+                    disturb_end = self.config["disturb_free_end"]
                     trigger_time = self.scheduler.adjust_time_avoid_disturb(trigger_time, disturb_start, disturb_end)
 
                     # 生成任务ID
@@ -1085,7 +1110,7 @@ class ProactiveReplyPlugin(Star):
 
             # 获取所有用户
             users = await self.db.get_all_users()
-            max_event_count = self.config.get("daily_max_event_count", 2)
+            max_event_count = self.config["daily_max_event_count"]
 
             async def process_user(user_id):
                 """处理单个用户的事件生成"""
@@ -1163,8 +1188,8 @@ class ProactiveReplyPlugin(Star):
                         # 单次遍历：校验间隔 → 防打扰调整 → 再校验 → 注册，直到达到上限
                         registered_times = []  # 已注册事件的最终触发时间（调整后）
                         remaining = max_event_count - event_count
-                        disturb_start = self.config.get("disturb_free_start", 0)
-                        disturb_end = self.config.get("disturb_free_end", 6)
+                        disturb_start = self.config["disturb_free_start"]
+                        disturb_end = self.config["disturb_free_end"]
                         min_interval_sec = MIN_EVENT_INTERVAL_HOURS * 3600
 
                         for event in events:
@@ -1250,8 +1275,11 @@ class ProactiveReplyPlugin(Star):
                     except (json.JSONDecodeError, KeyError, TypeError) as e:
                         logger.error(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]事件生成失败: {e}")
 
-            # 并发处理所有用户
-            await asyncio.gather(*[process_user(user_id) for user_id in users], return_exceptions=True)
+            # 分批并发处理，每批大小与信号量一致，避免一次性挂起大量协程
+            batch_size = self._llm_semaphore._value  # 与 Semaphore(5) 对齐
+            for i in range(0, len(users), batch_size):
+                batch = users[i:i + batch_size]
+                await asyncio.gather(*[process_user(uid) for uid in batch], return_exceptions=True)
 
             logger.info("[ProactiveReply] [定时任务] 每日事件生成完成")
 
@@ -1281,7 +1309,7 @@ class ProactiveReplyPlugin(Star):
 
                     # 1天未活跃触达（24小时）
                     if hours_inactive >= INACTIVE_1D_HOURS and hours_inactive < INACTIVE_6D_HOURS:
-                        if self.config.get("enable_inactive_1d_touch", True) and user_info['last_1d_inactive_touch_time'] == 0:
+                        if self.config["enable_inactive_1d_touch"] and user_info['last_1d_inactive_touch_time'] == 0:
                             logger.info(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]已{int(hours_inactive/24)}天未活跃，触发梯度1触达")
 
                             try:
@@ -1328,7 +1356,7 @@ class ProactiveReplyPlugin(Star):
 
                     # 6天未活跃触达（144小时）
                     elif hours_inactive >= INACTIVE_6D_HOURS:
-                        if self.config.get("enable_inactive_6d_touch", True) and user_info['last_6d_inactive_touch_time'] == 0:
+                        if self.config["enable_inactive_6d_touch"] and user_info['last_6d_inactive_touch_time'] == 0:
                             logger.info(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]已{int(hours_inactive/24)}天未活跃，触发梯度2触达")
 
                             try:
@@ -1373,8 +1401,11 @@ class ProactiveReplyPlugin(Star):
                             except (AttributeError, TypeError) as e:
                                 logger.error(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]梯度2触达失败: {e}")
 
-            # 并发处理所有用户
-            await asyncio.gather(*[process_user(user_id) for user_id in users], return_exceptions=True)
+            # 分批并发处理，每批大小与信号量一致，避免一次性挂起大量协程
+            batch_size = self._llm_semaphore._value
+            for i in range(0, len(users), batch_size):
+                batch = users[i:i + batch_size]
+                await asyncio.gather(*[process_user(uid) for uid in batch], return_exceptions=True)
 
             logger.info("[ProactiveReply] [定时任务] 未活跃用户扫描完成")
 

@@ -29,7 +29,7 @@ class DatabaseManager:
         self.db_path = db_path
         self.conn: Optional[sqlite3.Connection] = None
         self.beijing_tz = pytz.timezone('Asia/Shanghai')
-        self._write_lock = asyncio.Lock()
+        self._db_lock = asyncio.Lock()
 
     async def initialize(self):
         """初始化数据库连接和表结构"""
@@ -176,7 +176,8 @@ class DatabaseManager:
                 logger.error(f"[ProactiveReply] [数据库迁移] 获取数据库版本发生未知错误: {e}")
                 return 0
 
-        return await asyncio.to_thread(_get)
+        async with self._db_lock:
+            return await asyncio.to_thread(_get)
 
     async def _set_db_version(self, version: int):
         """设置数据库版本号"""
@@ -253,7 +254,7 @@ class DatabaseManager:
                 logger.error(f"[ProactiveReply] [数据库迁移] v2迁移失败: {e}")
                 raise
 
-        async with self._write_lock:
+        async with self._db_lock:
             await asyncio.to_thread(_migrate)
 
     def _get_beijing_timestamp(self) -> int:
@@ -304,7 +305,7 @@ class DatabaseManager:
                 self.conn.rollback()
                 logger.error(f"[ProactiveReply] [数据库] 更新用户活跃时间发生未知错误: {e}")
 
-        async with self._write_lock:
+        async with self._db_lock:
             await asyncio.to_thread(_update)
 
     async def get_user_info(self, user_id: str) -> Optional[Dict[str, Any]]:
@@ -336,7 +337,8 @@ class DatabaseManager:
                 logger.error(f"[ProactiveReply] [数据库] 获取用户信息发生未知错误: {e}")
                 return None
 
-        return await asyncio.to_thread(_get)
+        async with self._db_lock:
+            return await asyncio.to_thread(_get)
 
     async def add_task(self, task_id: str, user_id: str, trigger_time: int,
                       task_type: str, task_context: Dict[str, Any]) -> bool:
@@ -388,7 +390,7 @@ class DatabaseManager:
                 self.conn.rollback()
                 logger.error(f"[ProactiveReply] [数据库] 添加任务发生未知错误: {e}")
 
-        async with self._write_lock:
+        async with self._db_lock:
             await asyncio.to_thread(_add)
         return result[0]
 
@@ -451,7 +453,8 @@ class DatabaseManager:
                 logger.error(f"[ProactiveReply] [数据库] 获取待执行任务发生未知错误: {e}")
                 return []
 
-        return await asyncio.to_thread(_get)
+        async with self._db_lock:
+            return await asyncio.to_thread(_get)
 
     async def update_task_status(self, task_id: str, status: int, fail_reason: str = ""):
         """
@@ -489,7 +492,7 @@ class DatabaseManager:
                 self.conn.rollback()
                 logger.error(f"[ProactiveReply] [数据库] 更新任务状态发生未知错误: {e}")
 
-        async with self._write_lock:
+        async with self._db_lock:
             await asyncio.to_thread(_update)
 
     async def reset_daily_counters(self):
@@ -508,7 +511,7 @@ class DatabaseManager:
             except Exception as e:
                 logger.error(f"[ProactiveReply] [数据库] 重置每日计数器发生未知错误: {e}")
 
-        async with self._write_lock:
+        async with self._db_lock:
             await asyncio.to_thread(_reset)
 
     async def increment_greeting_count(self, user_id: str):
@@ -527,7 +530,7 @@ class DatabaseManager:
             except Exception as e:
                 logger.error(f"[ProactiveReply] [数据库] 增加问候次数发生未知错误: {e}")
 
-        async with self._write_lock:
+        async with self._db_lock:
             await asyncio.to_thread(_increment)
 
     async def increment_event_count(self, user_id: str):
@@ -546,7 +549,7 @@ class DatabaseManager:
             except Exception as e:
                 logger.error(f"[ProactiveReply] [数据库] 增加事件次数发生未知错误: {e}")
 
-        async with self._write_lock:
+        async with self._db_lock:
             await asyncio.to_thread(_increment)
 
     async def get_all_users(self) -> List[str]:
@@ -567,7 +570,8 @@ class DatabaseManager:
                 logger.error(f"[ProactiveReply] [数据库] 获取所有用户发生未知错误: {e}")
                 return []
 
-        return await asyncio.to_thread(_get)
+        async with self._db_lock:
+            return await asyncio.to_thread(_get)
 
     async def get_recent_message_count(self, user_id: str, hours: int) -> int:
         """
@@ -603,7 +607,8 @@ class DatabaseManager:
                 logger.error(f"[ProactiveReply] [数据库] 获取消息发送记录发生未知错误: {e}")
                 return 0
 
-        return await asyncio.to_thread(_get)
+        async with self._db_lock:
+            return await asyncio.to_thread(_get)
 
     async def record_message_sent(self, user_id: str, message_type: str = ""):
         """
@@ -630,7 +635,7 @@ class DatabaseManager:
             except Exception as e:
                 logger.error(f"[ProactiveReply] [数据库] 记录消息发送发生未知错误: {e}")
 
-        async with self._write_lock:
+        async with self._db_lock:
             await asyncio.to_thread(_record)
 
     async def cleanup_old_send_records(self, days: int = 7):
@@ -659,7 +664,7 @@ class DatabaseManager:
             except Exception as e:
                 logger.error(f"[ProactiveReply] [数据库] 清理旧消息记录发生未知错误: {e}")
 
-        async with self._write_lock:
+        async with self._db_lock:
             await asyncio.to_thread(_cleanup)
 
     async def update_inactive_touch_time(self, user_id: str, touch_type: str):
@@ -695,7 +700,7 @@ class DatabaseManager:
             except Exception as e:
                 logger.error(f"[ProactiveReply] [数据库] 更新触达时间发生未知错误: {e}")
 
-        async with self._write_lock:
+        async with self._db_lock:
             await asyncio.to_thread(_update)
 
     async def get_conversation_summary_cooldown(self, user_id: str) -> int:
@@ -722,7 +727,8 @@ class DatabaseManager:
                 logger.error(f"[ProactiveReply] [数据库] 获取冷却时间失败: {e}")
                 return 0
 
-        return await asyncio.to_thread(_get)
+        async with self._db_lock:
+            return await asyncio.to_thread(_get)
 
     async def set_conversation_summary_cooldown(self, user_id: str, timestamp: int):
         """更新用户对话总结冷却时间戳"""
@@ -741,7 +747,7 @@ class DatabaseManager:
                 self.conn.rollback()
                 logger.error(f"[ProactiveReply] [数据库] 更新冷却时间失败: {e}")
 
-        async with self._write_lock:
+        async with self._db_lock:
             await asyncio.to_thread(_set)
 
     async def close(self):
@@ -752,6 +758,6 @@ class DatabaseManager:
                 logger.info("[ProactiveReply] [数据库] 数据库连接已关闭")
 
         if self.conn:
-            async with self._write_lock:
+            async with self._db_lock:
                 await asyncio.to_thread(_close)
             self.conn = None
