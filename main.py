@@ -12,10 +12,9 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 
 from astrbot.api import logger
-from astrbot.api.star import Context, Star
+from astrbot.api.star import Context, Star, StarTools
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api import AstrBotConfig
-from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 from .database import DatabaseManager
 from .scheduler import TaskScheduler
@@ -52,9 +51,8 @@ class ProactiveReplyPlugin(Star):
         # 验证配置
         self._validate_config()
 
-        # 初始化数据库（使用文档推荐的 self.name 作为插件数据目录名）
-        plugin_data_path = Path(get_astrbot_data_path()) / "plugin_data" / self.name
-        db_path = plugin_data_path / "proactive_reply.db"
+        # 初始化数据库
+        db_path = StarTools.get_data_dir() / "proactive_reply.db"
         self.db = DatabaseManager(db_path)
 
         # 初始化调度器
@@ -65,6 +63,9 @@ class ProactiveReplyPlugin(Star):
 
         # 对话总结冷却时间记录 {user_id: timestamp}
         self.conversation_summary_cooldown: Dict[str, float] = {}
+
+        # LLM 并发控制信号量
+        self._llm_semaphore = asyncio.Semaphore(5)
 
         # 初始化状态标志
         self._initialized = False
@@ -188,6 +189,16 @@ class ProactiveReplyPlugin(Star):
             logger.error(f"[ProactiveReply] [配置验证] 配置验证失败: {e}")
         except Exception as e:
             logger.error(f"[ProactiveReply] [配置验证] 配置验证发生未知错误: {e}")
+
+    def _extract_json_from_text(self, text: str) -> Optional[str]:
+        """从文本中提取 JSON，处理 markdown 代码块"""
+        # 先尝试提取 markdown 代码块中的内容
+        code_block_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+        if code_block_match:
+            return code_block_match.group(1)
+        # 否则直接提取 JSON
+        json_match = re.search(r'\{.*\}', text, re.DOTALL)
+        return json_match.group() if json_match else None
 
     async def _async_init(self):
         """异步初始化任务"""
@@ -616,11 +627,10 @@ class ProactiveReplyPlugin(Star):
                 return None
 
             # 解析 JSON 响应
-            # 尝试提取 JSON
-            json_match = re.search(r'\{.*\}', llm_resp.completion_text, re.DOTALL)
-            if json_match:
+            json_str = self._extract_json_from_text(llm_resp.completion_text)
+            if json_str:
                 try:
-                    decision = json.loads(json_match.group())
+                    decision = json.loads(json_str)
 
                     # 验证必需字段
                     if not isinstance(decision.get('need_reply'), bool):
@@ -1047,23 +1057,25 @@ class ProactiveReplyPlugin(Star):
             users = await self.db.get_all_users()
             max_event_count = self.config.get("daily_max_event_count", 2)
 
-            for user_id in users:
-                user_info = await self.db.get_user_info(user_id)
-                if not user_info:
-                    continue
+            async def process_user(user_id):
+                """处理单个用户的事件生成"""
+                async with self._llm_semaphore:
+                    user_info = await self.db.get_user_info(user_id)
+                    if not user_info:
+                        return
 
-                # 检查今日事件次数
-                event_count = user_info.get('today_event_count', 0)
-                if event_count >= max_event_count:
-                    logger.debug(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]今日事件次数已达上限，跳过")
-                    continue
+                    # 检查今日事件次数
+                    event_count = user_info.get('today_event_count', 0)
+                    if event_count >= max_event_count:
+                        logger.debug(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]今日事件次数已达上限，跳过")
+                        return
 
-                # 生成事件（调用 LLM）
-                try:
-                    provider_id = await self.context.get_current_chat_provider_id(umo=user_id)
-                    now = self.scheduler.get_beijing_time()
+                    # 生成事件（调用 LLM）
+                    try:
+                        provider_id = await self.context.get_current_chat_provider_id(umo=user_id)
+                        now = self.scheduler.get_beijing_time()
 
-                    prompt = f"""请基于角色人设，生成最多{max_event_count - event_count}个符合今天的日常事件。
+                        prompt = f"""请基于角色人设，生成最多{max_event_count - event_count}个符合今天的日常事件。
 
 当前日期：{now.strftime('%Y-%m-%d')}
 当前时间：{now.strftime('%H:%M')}
@@ -1080,110 +1092,111 @@ class ProactiveReplyPlugin(Star):
 - 两个事件间隔至少4小时
 - 事件要符合角色人设和日常习惯"""
 
-                    try:
-                        llm_resp = await asyncio.wait_for(
-                            self.context.llm_generate(
-                                chat_provider_id=provider_id,
-                                prompt=prompt
-                            ),
-                            timeout=LLM_TIMEOUT_SECONDS
-                        )
-                    except asyncio.TimeoutError:
-                        logger.error(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]LLM调用超时（{LLM_TIMEOUT_SECONDS}秒）")
-                        continue
-
-                    # 解析 JSON
-                    json_match = re.search(r'\{.*\}', llm_resp.completion_text, re.DOTALL)
-                    if not json_match:
-                        logger.warning(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]事件生成失败：无法解析JSON")
-                        continue
-
-                    try:
-                        events_data = json.loads(json_match.group())
-                    except json.JSONDecodeError as e:
-                        logger.error(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]JSON解析失败: {e}")
-                        continue
-
-                    # 验证JSON结构
-                    if not isinstance(events_data, dict):
-                        logger.error(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]JSON格式错误：不是字典类型")
-                        continue
-
-                    events = events_data.get("events", [])
-                    if not isinstance(events, list):
-                        logger.error(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]events字段不是列表类型")
-                        continue
-
-                    if not events:
-                        logger.info(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]无事件生成")
-                        continue
-
-                    # 注册事件任务
-                    for event in events[:max_event_count - event_count]:
-                        if not isinstance(event, dict):
-                            logger.warning(f"[ProactiveReply] [事件生成] 事件格式错误，跳过")
-                            continue
-
-                        time_str = event.get("time", "")
-                        content = event.get("content", "")
-
-                        if not time_str or not content:
-                            logger.warning(f"[ProactiveReply] [事件生成] 事件缺少必需字段，跳过")
-                            continue
-
-                        # 解析时间
                         try:
-                            hour, minute = map(int, time_str.split(':'))
-                            trigger_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-
-                            # 如果时间已过，跳过
-                            if trigger_time <= now:
-                                continue
-
-                            # 避开防打扰时段
-                            disturb_start = self.config.get("disturb_free_start", 0)
-                            disturb_end = self.config.get("disturb_free_end", 6)
-                            trigger_time = self.scheduler.adjust_time_avoid_disturb(trigger_time, disturb_start, disturb_end)
-
-                            # 生成任务ID
-                            task_id = f"event_{user_id}_{uuid.uuid4().hex[:8]}"
-
-                            # 保存任务
-                            task_context = {
-                                "event_content": content
-                            }
-                            await self.db.add_task(
-                                task_id,
-                                user_id,
-                                int(trigger_time.timestamp()),
-                                "event",
-                                task_context
+                            llm_resp = await asyncio.wait_for(
+                                self.context.llm_generate(
+                                    chat_provider_id=provider_id,
+                                    prompt=prompt
+                                ),
+                                timeout=LLM_TIMEOUT_SECONDS
                             )
+                        except asyncio.TimeoutError:
+                            logger.error(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]LLM调用超时（{LLM_TIMEOUT_SECONDS}秒）")
+                            return
 
-                            # 注册到调度器
-                            if not self.scheduler.add_one_time_task(
-                                task_id,
-                                trigger_time,
-                                self._execute_event_task,
-                                task_id
-                            ):
-                                logger.warning(f"[ProactiveReply] [事件生成] 任务[{task_id}]调度器注册失败，跳过")
+                        # 解析 JSON
+                        json_str = self._extract_json_from_text(llm_resp.completion_text)
+                        if not json_str:
+                            logger.warning(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]事件生成失败：无法解析JSON")
+                            return
+
+                        try:
+                            events_data = json.loads(json_str)
+                        except json.JSONDecodeError as e:
+                            logger.error(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]JSON解析失败: {e}")
+                            return
+
+                        # 验证JSON结构
+                        if not isinstance(events_data, dict):
+                            logger.error(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]JSON格式错误：不是字典类型")
+                            return
+
+                        events = events_data.get("events", [])
+                        if not isinstance(events, list):
+                            logger.error(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]events字段不是列表类型")
+                            return
+
+                        if not events:
+                            logger.info(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]无事件生成")
+                            return
+
+                        # 注册事件任务
+                        for event in events[:max_event_count - event_count]:
+                            if not isinstance(event, dict):
+                                logger.warning(f"[ProactiveReply] [事件生成] 事件格式错误，跳过")
                                 continue
 
-                            logger.info(f"[ProactiveReply] [事件生成] 为用户[{user_id[:16]}...]生成日常事件任务，"
-                                       f"触发时间：{trigger_time.strftime('%Y-%m-%d %H:%M')}（北京时间），"
-                                       f"事件内容：{content}")
+                            time_str = event.get("time", "")
+                            content = event.get("content", "")
 
-                        except (ValueError, TypeError) as e:
-                            logger.warning(f"[ProactiveReply] [事件生成] 解析事件时间失败: {e}")
-                            continue
+                            if not time_str or not content:
+                                logger.warning(f"[ProactiveReply] [事件生成] 事件缺少必需字段，跳过")
+                                continue
 
-                except asyncio.TimeoutError:
-                    logger.error(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]LLM调用超时")
-                    continue
-                except (json.JSONDecodeError, KeyError, TypeError) as e:
-                    logger.error(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]事件生成失败: {e}")
-                    continue
+                            # 解析时间
+                            try:
+                                hour, minute = map(int, time_str.split(':'))
+                                trigger_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+                                # 如果时间已过，跳过
+                                if trigger_time <= now:
+                                    continue
+
+                                # 避开防打扰时段
+                                disturb_start = self.config.get("disturb_free_start", 0)
+                                disturb_end = self.config.get("disturb_free_end", 6)
+                                trigger_time = self.scheduler.adjust_time_avoid_disturb(trigger_time, disturb_start, disturb_end)
+
+                                # 生成任务ID
+                                task_id = f"event_{user_id}_{uuid.uuid4().hex[:8]}"
+
+                                # 保存任务
+                                task_context = {
+                                    "event_content": content
+                                }
+                                await self.db.add_task(
+                                    task_id,
+                                    user_id,
+                                    int(trigger_time.timestamp()),
+                                    "event",
+                                    task_context
+                                )
+
+                                # 注册到调度器
+                                if not self.scheduler.add_one_time_task(
+                                    task_id,
+                                    trigger_time,
+                                    self._execute_event_task,
+                                    task_id
+                                ):
+                                    logger.warning(f"[ProactiveReply] [事件生成] 任务[{task_id}]调度器注册失败，跳过")
+                                    continue
+
+                                logger.info(f"[ProactiveReply] [事件生成] 为用户[{user_id[:16]}...]生成日常事件任务，"
+                                           f"触发时间：{trigger_time.strftime('%Y-%m-%d %H:%M')}（北京时间），"
+                                           f"事件内容：{content}")
+
+                            except (ValueError, TypeError) as e:
+                                logger.warning(f"[ProactiveReply] [事件生成] 解析事件时间失败: {e}")
+                                continue
+
+                    except asyncio.TimeoutError:
+                        logger.error(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]LLM调用超时")
+                    except (json.JSONDecodeError, KeyError, TypeError) as e:
+                        logger.error(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]事件生成失败: {e}")
+
+            # 并发处理所有用户
+            await asyncio.gather(*[process_user(user_id) for user_id in users], return_exceptions=True)
 
             logger.info("[ProactiveReply] [定时任务] 每日事件生成完成")
 
@@ -1201,29 +1214,28 @@ class ProactiveReplyPlugin(Star):
             now = self.scheduler.get_beijing_time()
             users = await self.db.get_all_users()
 
-            for user_id in users:
-                user_info = await self.db.get_user_info(user_id)
-                if not user_info:
-                    continue
+            async def process_user(user_id):
+                """处理单个用户的未活跃检查"""
+                async with self._llm_semaphore:
+                    user_info = await self.db.get_user_info(user_id)
+                    if not user_info:
+                        return
 
-                last_active = datetime.fromtimestamp(user_info['last_active_time'], self.scheduler.beijing_tz)
-                hours_inactive = (now - last_active).total_seconds() / 3600  # 使用小时数更精确
+                    last_active = datetime.fromtimestamp(user_info['last_active_time'], self.scheduler.beijing_tz)
+                    hours_inactive = (now - last_active).total_seconds() / 3600
 
-                # 1天未活跃触达（24小时）
-                if hours_inactive >= INACTIVE_1D_HOURS and hours_inactive < INACTIVE_6D_HOURS:  # 24小时到6天
-                    if self.config.get("enable_inactive_1d_touch", True) and user_info['last_1d_inactive_touch_time'] == 0:
-                        logger.info(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]已{int(hours_inactive/24)}天未活跃，触发梯度1触达")
+                    # 1天未活跃触达（24小时）
+                    if hours_inactive >= INACTIVE_1D_HOURS and hours_inactive < INACTIVE_6D_HOURS:
+                        if self.config.get("enable_inactive_1d_touch", True) and user_info['last_1d_inactive_touch_time'] == 0:
+                            logger.info(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]已{int(hours_inactive/24)}天未活跃，触发梯度1触达")
 
-                        # 生成触达消息
-                        try:
-                            provider_id = await self.context.get_current_chat_provider_id(umo=user_id)
+                            try:
+                                provider_id = await self.context.get_current_chat_provider_id(umo=user_id)
+                                persona_mgr = self.context.persona_manager
+                                persona = await persona_mgr.get_default_persona_v3(umo=user_id)
+                                persona_prompt = persona.prompt if persona and hasattr(persona, 'prompt') else ""
 
-                            # 获取人设
-                            persona_mgr = self.context.persona_manager
-                            persona = await persona_mgr.get_default_persona_v3(umo=user_id)
-                            persona_prompt = persona.prompt if persona and hasattr(persona, 'prompt') else ""
-
-                            prompt = f"""请基于角色人设，生成一条自然的问候/关心消息，因为用户已经1天没有和你聊天了。
+                                prompt = f"""请基于角色人设，生成一条自然的问候/关心消息，因为用户已经1天没有和你聊天了。
 
 人设：{persona_prompt}
 
@@ -1235,48 +1247,42 @@ class ProactiveReplyPlugin(Star):
 
 直接输出消息内容，不要有其他说明。"""
 
-                            try:
-                                llm_resp = await asyncio.wait_for(
-                                    self.context.llm_generate(
-                                        chat_provider_id=provider_id,
-                                        prompt=prompt
-                                    ),
-                                    timeout=LLM_TIMEOUT_SECONDS
-                                )
+                                try:
+                                    llm_resp = await asyncio.wait_for(
+                                        self.context.llm_generate(
+                                            chat_provider_id=provider_id,
+                                            prompt=prompt
+                                        ),
+                                        timeout=LLM_TIMEOUT_SECONDS
+                                    )
+                                except asyncio.TimeoutError:
+                                    logger.error(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]LLM调用超时（{LLM_TIMEOUT_SECONDS}秒）")
+                                    return
+
+                                message = llm_resp.completion_text.strip()
+                                success = await self._send_proactive_message(user_id, message)
+
+                                if success:
+                                    await self.db.update_inactive_touch_time(user_id, "1d")
+                                    logger.info(f"[ProactiveReply] [消息发送] 用户[{user_id[:16]}...]的未活跃触达消息发送成功，梯度：1")
+
                             except asyncio.TimeoutError:
-                                logger.error(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]LLM调用超时（{LLM_TIMEOUT_SECONDS}秒）")
-                                continue
+                                logger.error(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]LLM调用超时")
+                            except (AttributeError, TypeError) as e:
+                                logger.error(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]梯度1触达失败: {e}")
 
-                            message = llm_resp.completion_text.strip()
+                    # 6天未活跃触达（144小时）
+                    elif hours_inactive >= INACTIVE_6D_HOURS:
+                        if self.config.get("enable_inactive_6d_touch", True) and user_info['last_6d_inactive_touch_time'] == 0:
+                            logger.info(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]已{int(hours_inactive/24)}天未活跃，触发梯度2触达")
 
-                            # 发送消息
-                            success = await self._send_proactive_message(user_id, message)
+                            try:
+                                provider_id = await self.context.get_current_chat_provider_id(umo=user_id)
+                                persona_mgr = self.context.persona_manager
+                                persona = await persona_mgr.get_default_persona_v3(umo=user_id)
+                                persona_prompt = persona.prompt if persona and hasattr(persona, 'prompt') else ""
 
-                            if success:
-                                # 更新触达时间
-                                await self.db.update_inactive_touch_time(user_id, "1d")
-                                logger.info(f"[ProactiveReply] [消息发送] 用户[{user_id[:16]}...]的未活跃触达消息发送成功，梯度：1")
-
-                        except asyncio.TimeoutError:
-                            logger.error(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]LLM调用超时")
-                        except (AttributeError, TypeError) as e:
-                            logger.error(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]梯度1触达失败: {e}")
-
-                # 6天未活跃触达（144小时）
-                elif hours_inactive >= INACTIVE_6D_HOURS:  # 6天
-                    if self.config.get("enable_inactive_6d_touch", True) and user_info['last_6d_inactive_touch_time'] == 0:
-                        logger.info(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]已{int(hours_inactive/24)}天未活跃，触发梯度2触达")
-
-                        # 生成触达消息（带情绪）
-                        try:
-                            provider_id = await self.context.get_current_chat_provider_id(umo=user_id)
-
-                            # 获取人设
-                            persona_mgr = self.context.persona_manager
-                            persona = await persona_mgr.get_default_persona_v3(umo=user_id)
-                            persona_prompt = persona.prompt if persona and hasattr(persona, 'prompt') else ""
-
-                            prompt = f"""请基于角色人设，生成一条带点生气、质问语气的消息，因为用户已经超过6天没有和你聊天了。
+                                prompt = f"""请基于角色人设，生成一条带点生气、质问语气的消息，因为用户已经超过6天没有和你聊天了。
 
 人设：{persona_prompt}
 
@@ -1288,32 +1294,32 @@ class ProactiveReplyPlugin(Star):
 
 直接输出消息内容，不要有其他说明。"""
 
-                            try:
-                                llm_resp = await asyncio.wait_for(
-                                    self.context.llm_generate(
-                                        chat_provider_id=provider_id,
-                                        prompt=prompt
-                                    ),
-                                    timeout=LLM_TIMEOUT_SECONDS
-                                )
+                                try:
+                                    llm_resp = await asyncio.wait_for(
+                                        self.context.llm_generate(
+                                            chat_provider_id=provider_id,
+                                            prompt=prompt
+                                        ),
+                                        timeout=LLM_TIMEOUT_SECONDS
+                                    )
+                                except asyncio.TimeoutError:
+                                    logger.error(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]LLM调用超时（{LLM_TIMEOUT_SECONDS}秒）")
+                                    return
+
+                                message = llm_resp.completion_text.strip()
+                                success = await self._send_proactive_message(user_id, message)
+
+                                if success:
+                                    await self.db.update_inactive_touch_time(user_id, "6d")
+                                    logger.info(f"[ProactiveReply] [消息发送] 用户[{user_id[:16]}...]的未活跃触达消息发送成功，梯度：2")
+
                             except asyncio.TimeoutError:
-                                logger.error(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]LLM调用超时（{LLM_TIMEOUT_SECONDS}秒）")
-                                continue
+                                logger.error(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]LLM调用超时")
+                            except (AttributeError, TypeError) as e:
+                                logger.error(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]梯度2触达失败: {e}")
 
-                            message = llm_resp.completion_text.strip()
-
-                            # 发送消息
-                            success = await self._send_proactive_message(user_id, message)
-
-                            if success:
-                                # 更新触达时间
-                                await self.db.update_inactive_touch_time(user_id, "6d")
-                                logger.info(f"[ProactiveReply] [消息发送] 用户[{user_id[:16]}...]的未活跃触达消息发送成功，梯度：2")
-
-                        except asyncio.TimeoutError:
-                            logger.error(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]LLM调用超时")
-                        except (AttributeError, TypeError) as e:
-                            logger.error(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]梯度2触达失败: {e}")
+            # 并发处理所有用户
+            await asyncio.gather(*[process_user(user_id) for user_id in users], return_exceptions=True)
 
             logger.info("[ProactiveReply] [定时任务] 未活跃用户扫描完成")
 

@@ -309,6 +309,12 @@ astrbot_plugin_Pseudo_people_chat_actively/
 - ✅ 群聊检测：使用 `event.get_group_id()` 正确检测群聊消息
 - ✅ 异步初始化：添加 `@filter.on_astrbot_loaded()` 钩子进行异步初始化
 
+### 待优化
+- 群聊场景优化：当前群聊场景下 user_id 处理可能不够完善，建议后续优化为 `group_id + user_id` 组合
+- 数据库连接健康检查：虽然检查了 `if not self.conn`，但无法检测连接是否已关闭，建议后续添加连接健康检查
+- 配置验证增强：`greeting_probabilities` 可以添加总和验证，确保概率值合理
+- 任务优先级机制：实现任务优先级，确保重要任务优先执行
+- 缓存机制：添加缓存机制，减少重复的数据库查询和 LLM 调用 
 
 ## 许可证
 
@@ -319,6 +325,22 @@ Apache License 2.0
 欢迎提交 Issue 和 Pull Request！请给项目点个 star 支持一下！
 
 ## 更新日志
+
+### v1.3.1 (2026-03-11)
+
+**重大修复：**
+- 🔴 修复数据目录获取方式：使用 `StarTools.get_data_dir()` 替代 `get_astrbot_data_path()`，更符合 AstrBot 官方规范
+- 🔴 修复插件重载场景：直接使用 `asyncio.create_task` 启动异步初始化，兼容插件重载场景
+
+**优化改进：**
+- ✅ 添加 LLM 并发控制：使用 `asyncio.Semaphore(5)` 限制并发 LLM 调用数量，防止 LLM 服务过载
+- ✅ 优化事件生成性能：在每日事件生成和未活跃用户扫描时使用信号量控制并发
+- ✅ 移除 @filter.on_astrbot_loaded() 钩子：改为直接在 `__init__` 中创建异步任务，简化初始化流程
+
+**技术细节：**
+- 数据目录获取：使用 `StarTools.get_data_dir() / "proactive_reply.db"`
+- 并发控制：在 `_generate_daily_events` 和 `_scan_inactive_users` 中使用信号量限制并发
+- 初始化方式：`asyncio.create_task(self._async_init())` 直接在构造函数中调用
 
 ### v1.3.0 (2026-03-11)
 
@@ -450,5 +472,4 @@ Apache License 2.0
 - 总代码行数：约 2318 行
 - 核心模块：3 个（main.py, database.py, scheduler.py）
 - 配置项：17 个
-
 - 数据表：4 个 + 1 个版本表
