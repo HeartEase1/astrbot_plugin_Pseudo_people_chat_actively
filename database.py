@@ -331,7 +331,7 @@ class DatabaseManager:
         return await asyncio.to_thread(_get)
 
     async def add_task(self, task_id: str, user_id: str, trigger_time: int,
-                      task_type: str, task_context: Dict[str, Any]):
+                      task_type: str, task_context: Dict[str, Any]) -> bool:
         """
         添加待执行任务
 
@@ -341,7 +341,12 @@ class DatabaseManager:
             trigger_time: 触发时间戳（北京时间）
             task_type: 任务类型
             task_context: 任务上下文
+
+        Returns:
+            是否添加成功
         """
+        result = [False]
+
         def _add():
             try:
                 # 检查数据库连接
@@ -364,6 +369,7 @@ class DatabaseManager:
                 trigger_dt = datetime.fromtimestamp(trigger_time, self.beijing_tz)
                 logger.info(f"[ProactiveReply] [任务注册] 用户[{user_id[:8]}...]任务注册成功，任务ID：{task_id}，"
                            f"触发时间：{trigger_dt.strftime('%Y-%m-%d %H:%M')}（北京时间）")
+                result[0] = True
             except sqlite3.Error as e:
                 self.conn.rollback()
                 logger.error(f"[ProactiveReply] [数据库] 添加任务失败: {e}")
@@ -376,6 +382,7 @@ class DatabaseManager:
 
         async with self._write_lock:
             await asyncio.to_thread(_add)
+        return result[0]
 
     async def get_pending_tasks(self, user_id: Optional[str] = None, task_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """
@@ -421,15 +428,16 @@ class DatabaseManager:
                 for row in rows:
                     task = dict(row)
                     if task['task_context']:
-                        task['task_context'] = json.loads(task['task_context'])
+                        try:
+                            task['task_context'] = json.loads(task['task_context'])
+                        except (json.JSONDecodeError, ValueError) as parse_err:
+                            logger.warning(f"[ProactiveReply] [数据库] 任务[{task.get('task_id')}]上下文解析失败，跳过: {parse_err}")
+                            continue
                     tasks.append(task)
 
                 return tasks
             except sqlite3.Error as e:
                 logger.error(f"[ProactiveReply] [数据库] 获取待执行任务失败: {e}")
-                return []
-            except (json.JSONDecodeError, KeyError) as e:
-                logger.error(f"[ProactiveReply] [数据库] 任务数据解析失败: {e}")
                 return []
             except Exception as e:
                 logger.error(f"[ProactiveReply] [数据库] 获取待执行任务发生未知错误: {e}")
@@ -492,7 +500,8 @@ class DatabaseManager:
             except Exception as e:
                 logger.error(f"[ProactiveReply] [数据库] 重置每日计数器发生未知错误: {e}")
 
-        await asyncio.to_thread(_reset)
+        async with self._write_lock:
+            await asyncio.to_thread(_reset)
 
     async def increment_greeting_count(self, user_id: str):
         """增加用户问候次数"""
@@ -607,7 +616,8 @@ class DatabaseManager:
             except Exception as e:
                 logger.error(f"[ProactiveReply] [数据库] 记录消息发送发生未知错误: {e}")
 
-        await asyncio.to_thread(_record)
+        async with self._write_lock:
+            await asyncio.to_thread(_record)
 
     async def cleanup_old_send_records(self, days: int = 7):
         """
@@ -635,7 +645,8 @@ class DatabaseManager:
             except Exception as e:
                 logger.error(f"[ProactiveReply] [数据库] 清理旧消息记录发生未知错误: {e}")
 
-        await asyncio.to_thread(_cleanup)
+        async with self._write_lock:
+            await asyncio.to_thread(_cleanup)
 
     async def update_inactive_touch_time(self, user_id: str, touch_type: str):
         """
@@ -681,5 +692,6 @@ class DatabaseManager:
                 logger.info("[ProactiveReply] [数据库] 数据库连接已关闭")
 
         if self.conn:
-            await asyncio.to_thread(_close)
+            async with self._write_lock:
+                await asyncio.to_thread(_close)
             self.conn = None

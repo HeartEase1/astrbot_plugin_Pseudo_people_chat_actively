@@ -66,6 +66,9 @@ class ProactiveReplyPlugin(Star):
         # LLM 并发控制信号量
         self._llm_semaphore = asyncio.Semaphore(5)
 
+        # 每用户发送频控锁，保证 check+record 原子性
+        self._send_locks: Dict[str, asyncio.Lock] = {}
+
         # 初始化状态标志
         self._initialized = False
 
@@ -195,9 +198,33 @@ class ProactiveReplyPlugin(Star):
         code_block_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
         if code_block_match:
             return code_block_match.group(1)
-        # 否则直接提取 JSON
-        json_match = re.search(r'\{.*\}', text, re.DOTALL)
-        return json_match.group() if json_match else None
+
+        # 使用括号平衡扫描提取第一个完整 JSON 对象，避免贪婪匹配跨越多个块
+        start = text.find('{')
+        if start == -1:
+            return None
+        depth = 0
+        in_string = False
+        escape_next = False
+        for i, ch in enumerate(text[start:], start):
+            if escape_next:
+                escape_next = False
+                continue
+            if ch == '\\' and in_string:
+                escape_next = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
+        return None
 
     async def _async_init(self):
         """异步初始化任务"""
@@ -445,8 +472,9 @@ class ProactiveReplyPlugin(Star):
         except Exception as e:
             logger.error(f"[ProactiveReply] [对话判定] 对话结束倒计时发生未知错误: {e}")
         finally:
-            # 清理已完成的任务
-            if user_id in self.conversation_timers:
+            # 仅删除当前任务自身对应的映射，避免误删新计时任务
+            current_task = asyncio.current_task()
+            if self.conversation_timers.get(user_id) is current_task:
                 del self.conversation_timers[user_id]
 
     async def _cancel_user_conversation_tasks(self, user_id: str):
@@ -706,18 +734,21 @@ class ProactiveReplyPlugin(Star):
             # 生成任务ID
             task_id = f"{task_type}_{user_id}_{uuid.uuid4().hex[:8]}"
 
-            # 保存任务到数据库
+            # 保存任务到数据库，失败则终止后续调度器注册
             task_context = {
                 "summary": context_data,
                 "reason": decision.get("reason", "")
             }
-            await self.db.add_task(
+            db_ok = await self.db.add_task(
                 task_id,
                 user_id,
                 int(trigger_time.timestamp()),
                 task_type,
                 task_context
             )
+            if not db_ok:
+                logger.error(f"[ProactiveReply] [任务注册] 任务[{task_id}]数据库保存失败，终止注册")
+                return
 
             # 注册到调度器
             if not self.scheduler.add_one_time_task(
@@ -855,13 +886,22 @@ class ProactiveReplyPlugin(Star):
             是否发送成功
         """
         try:
-            # 检查频率限制
-            freq_limit = self.config.get("qq_msg_frequency_limit", 2)
-            recent_count = await self.db.get_recent_message_count(user_id, hours=MESSAGE_FREQUENCY_CHECK_HOURS)
+            # 获取或创建该用户的发送锁，保证 check+record 原子性
+            if user_id not in self._send_locks:
+                self._send_locks[user_id] = asyncio.Lock()
+            send_lock = self._send_locks[user_id]
 
-            if recent_count >= freq_limit:
-                logger.warning(f"[ProactiveReply] [消息发送] 用户[{user_id[:16]}...]触发频率限制（{MESSAGE_FREQUENCY_CHECK_HOURS}小时内已发送{recent_count}条，限制{freq_limit}条），跳过发送")
-                return False
+            async with send_lock:
+                # 检查频率限制
+                freq_limit = self.config.get("qq_msg_frequency_limit", 2)
+                recent_count = await self.db.get_recent_message_count(user_id, hours=MESSAGE_FREQUENCY_CHECK_HOURS)
+
+                if recent_count >= freq_limit:
+                    logger.warning(f"[ProactiveReply] [消息发送] 用户[{user_id[:16]}...]触发频率限制（{MESSAGE_FREQUENCY_CHECK_HOURS}小时内已发送{recent_count}条，限制{freq_limit}条），跳过发送")
+                    return False
+
+                # 先记录发送，再实际发送，确保并发下不超限
+                await self.db.record_message_sent(user_id, "proactive")
 
             # QQ戳一戳功能（仅aiocqhttp平台）
             if self.config.get("enable_qq_poke", False):
@@ -871,9 +911,6 @@ class ProactiveReplyPlugin(Star):
             message_chain = MessageChain().message(message)
 
             await self.context.send_message(user_id, message_chain)
-
-            # 记录发送时间
-            await self.db.record_message_sent(user_id, "proactive")
 
             return True
 
@@ -1011,18 +1048,21 @@ class ProactiveReplyPlugin(Star):
                     # 生成任务ID
                     task_id = f"greeting_{user_id}_{uuid.uuid4().hex[:8]}"
 
-                    # 保存任务
+                    # 保存任务，失败则跳过调度器注册
                     task_context = {
                         "time_range": time_range.get("name", ""),
                         "greeting_index": generated_count + 1
                     }
-                    await self.db.add_task(
+                    db_ok = await self.db.add_task(
                         task_id,
                         user_id,
                         int(trigger_time.timestamp()),
                         "greeting",
                         task_context
                     )
+                    if not db_ok:
+                        logger.error(f"[ProactiveReply] [问候计划] 任务[{task_id}]数据库保存失败，跳过调度器注册")
+                        continue
 
                     # 注册到调度器
                     if not self.scheduler.add_one_time_task(
@@ -1129,6 +1169,31 @@ class ProactiveReplyPlugin(Star):
                             logger.info(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]无事件生成")
                             return
 
+                        # 程序化校验事件间隔（MIN_EVENT_INTERVAL_HOURS），过滤/重排不满足间隔的事件
+                        validated_events = []
+                        for event in events:
+                            if not isinstance(event, dict):
+                                continue
+                            time_str = event.get("time", "")
+                            if not time_str:
+                                continue
+                            try:
+                                hour, minute = map(int, time_str.split(':'))
+                                candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                            except (ValueError, TypeError):
+                                continue
+                            if candidate <= now:
+                                continue
+                            # 检查与已验证事件的间隔
+                            too_close = any(
+                                abs((candidate - prev).total_seconds()) < MIN_EVENT_INTERVAL_HOURS * 3600
+                                for prev in validated_events
+                            )
+                            if too_close:
+                                logger.warning(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]事件时间{time_str}与已有事件间隔不足{MIN_EVENT_INTERVAL_HOURS}小时，跳过")
+                                continue
+                            validated_events.append(candidate)
+
                         # 注册事件任务
                         for event in events[:max_event_count - event_count]:
                             if not isinstance(event, dict):
@@ -1151,6 +1216,10 @@ class ProactiveReplyPlugin(Star):
                                 if trigger_time <= now:
                                     continue
 
+                                # 跳过未通过间隔校验的事件
+                                if trigger_time not in validated_events:
+                                    continue
+
                                 # 避开防打扰时段
                                 disturb_start = self.config.get("disturb_free_start", 0)
                                 disturb_end = self.config.get("disturb_free_end", 6)
@@ -1159,17 +1228,20 @@ class ProactiveReplyPlugin(Star):
                                 # 生成任务ID
                                 task_id = f"event_{user_id}_{uuid.uuid4().hex[:8]}"
 
-                                # 保存任务
+                                # 保存任务，失败则跳过调度器注册
                                 task_context = {
                                     "event_content": content
                                 }
-                                await self.db.add_task(
+                                db_ok = await self.db.add_task(
                                     task_id,
                                     user_id,
                                     int(trigger_time.timestamp()),
                                     "event",
                                     task_context
                                 )
+                                if not db_ok:
+                                    logger.error(f"[ProactiveReply] [事件生成] 任务[{task_id}]数据库保存失败，跳过调度器注册")
+                                    continue
 
                                 # 注册到调度器
                                 if not self.scheduler.add_one_time_task(

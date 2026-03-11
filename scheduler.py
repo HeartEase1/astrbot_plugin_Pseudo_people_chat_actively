@@ -4,11 +4,12 @@
 强制锁定北京时间时区
 """
 from datetime import datetime, timedelta
-from typing import Callable, Optional
+from typing import Callable, List
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.jobstores.base import JobLookupError
 from astrbot.api import logger
 
 
@@ -190,8 +191,10 @@ class TaskScheduler:
         try:
             self.scheduler.remove_job(task_id)
             logger.info(f"[ProactiveReply] [定时任务] 任务[{task_id}]已移除")
+        except JobLookupError:
+            logger.debug(f"[ProactiveReply] [定时任务] 任务[{task_id}]不存在，跳过移除")
         except Exception as e:
-            logger.debug(f"[ProactiveReply] [定时任务] 移除任务失败（可能不存在）: {e}")
+            logger.warning(f"[ProactiveReply] [定时任务] 移除任务[{task_id}]时发生异常: {e}")
 
     def get_beijing_time(self) -> datetime:
         """获取当前北京时间"""
@@ -259,8 +262,8 @@ class TaskScheduler:
 
         return adjusted
 
-    def check_task_interval(self, new_time: datetime, existing_times: list,
-                           min_interval_hours: int) -> Optional[datetime]:
+    def check_task_interval(self, new_time: datetime, existing_times: List[datetime],
+                           min_interval_hours: int) -> datetime:
         """
         检查任务间隔是否满足最小间隔要求，找到合适的时间空隙
 
