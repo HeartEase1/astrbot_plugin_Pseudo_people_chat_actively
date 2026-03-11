@@ -309,12 +309,6 @@ astrbot_plugin_Pseudo_people_chat_actively/
 - ✅ 群聊检测：使用 `event.get_group_id()` 正确检测群聊消息
 - ✅ 异步初始化：添加 `@filter.on_astrbot_loaded()` 钩子进行异步初始化
 
-### 待优化
-- 群聊场景优化：当前群聊场景下 user_id 处理可能不够完善，建议后续优化为 `group_id + user_id` 组合
-- 数据库连接健康检查：虽然检查了 `if not self.conn`，但无法检测连接是否已关闭，建议后续添加连接健康检查
-- 配置验证增强：`greeting_probabilities` 可以添加总和验证，确保概率值合理
-- 任务优先级机制：实现任务优先级，确保重要任务优先执行
-- 缓存机制：添加缓存机制，减少重复的数据库查询和 LLM 调用 
 
 ## 许可证
 
@@ -456,4 +450,5 @@ Apache License 2.0
 - 总代码行数：约 2318 行
 - 核心模块：3 个（main.py, database.py, scheduler.py）
 - 配置项：17 个
+
 - 数据表：4 个 + 1 个版本表
