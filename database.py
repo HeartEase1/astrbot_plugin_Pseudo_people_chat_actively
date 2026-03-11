@@ -346,7 +346,7 @@ class DatabaseManager:
             try:
                 # 检查数据库连接
                 if not self.conn:
-                    logger.warning(f"[ProactiveReply] [数据库] 数据库连接已关闭，跳过添加任务")
+                    logger.warning("[ProactiveReply] [数据库] 数据库连接已关闭，跳过添加任务")
                     return
 
                 cursor = self.conn.cursor()
@@ -392,7 +392,7 @@ class DatabaseManager:
             try:
                 # 检查数据库连接
                 if not self.conn:
-                    logger.warning(f"[ProactiveReply] [数据库] 数据库连接已关闭，返回空任务列表")
+                    logger.warning("[ProactiveReply] [数据库] 数据库连接已关闭，返回空任务列表")
                     return []
 
                 cursor = self.conn.cursor()
@@ -450,7 +450,7 @@ class DatabaseManager:
             try:
                 # 检查数据库连接
                 if not self.conn:
-                    logger.warning(f"[ProactiveReply] [数据库] 数据库连接已关闭，跳过更新任务状态")
+                    logger.warning("[ProactiveReply] [数据库] 数据库连接已关闭，跳过更新任务状态")
                     return
 
                 cursor = self.conn.cursor()

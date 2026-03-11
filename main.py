@@ -7,8 +7,7 @@ import uuid
 import random
 import json
 import re
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime
 from typing import Dict, Any, Optional
 
 from astrbot.api import logger
@@ -171,7 +170,7 @@ class ProactiveReplyPlugin(Star):
                         else:
                             logger.warning(f"[ProactiveReply] [配置验证] 时段配置无效（start={start}, end={end}），跳过")
                     else:
-                        logger.warning(f"[ProactiveReply] [配置验证] 时段配置格式错误，跳过")
+                        logger.warning("[ProactiveReply] [配置验证] 时段配置格式错误，跳过")
 
                 if valid_ranges:
                     self.config["greeting_time_ranges"] = valid_ranges
@@ -545,7 +544,7 @@ class ProactiveReplyPlugin(Star):
         try:
             # history 是字符串格式，直接使用
             if not history or len(history.strip()) == 0:
-                logger.warning(f"[ProactiveReply] [上下文处理] 对话历史为空")
+                logger.warning("[ProactiveReply] [上下文处理] 对话历史为空")
                 return None
 
             # 限制历史长度（按字符数）
@@ -634,12 +633,12 @@ class ProactiveReplyPlugin(Star):
 
                     # 验证必需字段
                     if not isinstance(decision.get('need_reply'), bool):
-                        logger.error(f"[ProactiveReply] [LLM决策] 决策结果缺少或无效 need_reply 字段")
+                        logger.error("[ProactiveReply] [LLM决策] 决策结果缺少或无效 need_reply 字段")
                         return None
 
                     if decision['need_reply']:
                         if not decision.get('trigger_time'):
-                            logger.error(f"[ProactiveReply] [LLM决策] 决策结果缺少 trigger_time 字段")
+                            logger.error("[ProactiveReply] [LLM决策] 决策结果缺少 trigger_time 字段")
                             return None
                         # 验证时间格式
                         try:
@@ -657,7 +656,7 @@ class ProactiveReplyPlugin(Star):
                     logger.error(f"[ProactiveReply] [LLM决策] JSON解析失败: {e}")
                     return None
             else:
-                logger.error(f"[ProactiveReply] [LLM决策] 无法从响应中提取JSON")
+                logger.error("[ProactiveReply] [LLM决策] 无法从响应中提取JSON")
 
             return None
 
@@ -680,7 +679,7 @@ class ProactiveReplyPlugin(Star):
             # 解析触发时间
             trigger_time_str = decision.get("trigger_time")
             if not trigger_time_str:
-                logger.warning(f"[ProactiveReply] [任务注册] 触发时间为空，跳过")
+                logger.warning("[ProactiveReply] [任务注册] 触发时间为空，跳过")
                 return
 
             trigger_time = datetime.strptime(trigger_time_str, "%Y-%m-%d %H:%M")
@@ -918,7 +917,7 @@ class ProactiveReplyPlugin(Star):
                         break
 
                 if not aiocqhttp_platform:
-                    logger.debug(f"[ProactiveReply] [戳一戳] 未找到 aiocqhttp 平台实例，跳过戳一戳")
+                    logger.debug("[ProactiveReply] [戳一戳] 未找到 aiocqhttp 平台实例，跳过戳一戳")
                     return
 
                 # 通过文档推荐的 client.api.call_action 调用协议端 API
@@ -934,7 +933,7 @@ class ProactiveReplyPlugin(Star):
                 await asyncio.sleep(1)
 
             except AttributeError:
-                logger.debug(f"[ProactiveReply] [戳一戳] 平台不支持戳一戳功能")
+                logger.debug("[ProactiveReply] [戳一戳] 平台不支持戳一戳功能")
             except (ValueError, TypeError) as e:
                 logger.warning(f"[ProactiveReply] [戳一戳] 参数错误: {e}")
             except Exception as e:
@@ -1133,14 +1132,14 @@ class ProactiveReplyPlugin(Star):
                         # 注册事件任务
                         for event in events[:max_event_count - event_count]:
                             if not isinstance(event, dict):
-                                logger.warning(f"[ProactiveReply] [事件生成] 事件格式错误，跳过")
+                                logger.warning("[ProactiveReply] [事件生成] 事件格式错误，跳过")
                                 continue
 
                             time_str = event.get("time", "")
                             content = event.get("content", "")
 
                             if not time_str or not content:
-                                logger.warning(f"[ProactiveReply] [事件生成] 事件缺少必需字段，跳过")
+                                logger.warning("[ProactiveReply] [事件生成] 事件缺少必需字段，跳过")
                                 continue
 
                             # 解析时间

@@ -309,6 +309,7 @@ astrbot_plugin_Pseudo_people_chat_actively/
 - ✅ 群聊检测：使用 `event.get_group_id()` 正确检测群聊消息
 - ✅ 异步初始化：添加 `@filter.on_astrbot_loaded()` 钩子进行异步初始化
 
+
 ## 许可证
 
 Apache License 2.0
@@ -465,5 +466,4 @@ Apache License 2.0
 - 总代码行数：约 2318 行
 - 核心模块：3 个（main.py, database.py, scheduler.py）
 - 配置项：17 个
-
 - 数据表：4 个 + 1 个版本表
