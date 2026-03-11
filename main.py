@@ -19,7 +19,6 @@ from .database import DatabaseManager
 from .scheduler import TaskScheduler
 
 # 常量定义
-CONVERSATION_END_THRESHOLD_MINUTES = 10  # 对话结束判定阈值（分钟）
 CONVERSATION_SUMMARY_COOLDOWN_HOURS = 1  # 对话总结冷却时间（小时）
 INACTIVE_1D_HOURS = 24  # 1天未活跃阈值（小时）
 INACTIVE_6D_HOURS = 144  # 6天未活跃阈值（小时）
@@ -27,6 +26,7 @@ MIN_EVENT_INTERVAL_HOURS = 4  # 事件最小间隔（小时）
 LLM_TIMEOUT_SECONDS = 100.0  # LLM调用超时时间（秒）
 MESSAGE_FREQUENCY_CHECK_HOURS = 1  # 频率限制检查时间窗口（小时）
 OLD_RECORDS_RETENTION_DAYS = 7  # 旧记录保留天数
+_LLM_CONCURRENCY = 5  # LLM 并发度，与 Semaphore 保持一致
 
 
 class ProactiveReplyPlugin(Star):
@@ -61,7 +61,7 @@ class ProactiveReplyPlugin(Star):
         self.conversation_timers: Dict[str, asyncio.Task] = {}
 
         # LLM 并发控制信号量
-        self._llm_semaphore = asyncio.Semaphore(5)
+        self._llm_semaphore = asyncio.Semaphore(_LLM_CONCURRENCY)
 
         # 每用户发送频控锁，保证 check+record 原子性
         self._send_locks: Dict[str, asyncio.Lock] = {}
@@ -480,11 +480,11 @@ class ProactiveReplyPlugin(Star):
 
             logger.info(f"[ProactiveReply] [对话判定] 用户[{user_id[:16]}...]对话结束，触发上下文总结流程")
 
-            # 持久化本次总结时间
-            await self.db.set_conversation_summary_cooldown(user_id, int(now))
-
-            # 触发对话结束后的主动回复流程
+            # 触发对话结束后的主动回复流程，仅成功后才写入冷却时间
             await self._handle_conversation_end(user_id)
+
+            # 持久化本次总结时间（放在成功执行后，避免失败时误触发冷却）
+            await self.db.set_conversation_summary_cooldown(user_id, int(now))
 
         except asyncio.CancelledError:
             logger.info(f"[ProactiveReply] [对话判定] 用户[{user_id[:16]}...]有新消息，重置对话结束倒计时")
@@ -771,14 +771,15 @@ class ProactiveReplyPlugin(Star):
                 logger.error(f"[ProactiveReply] [任务注册] 任务[{task_id}]数据库保存失败，终止注册")
                 return
 
-            # 注册到调度器
+            # 注册到调度器，失败则将 DB 任务标记为取消，避免悬挂 pending 记录
             if not self.scheduler.add_one_time_task(
                 task_id,
                 trigger_time,
                 self._execute_task,
                 task_id
             ):
-                logger.warning(f"[ProactiveReply] [任务注册] 任务[{task_id}]调度器注册失败，已保存到数据库待下次恢复")
+                logger.warning(f"[ProactiveReply] [任务注册] 任务[{task_id}]调度器注册失败，标记为取消")
+                await self.db.update_task_status(task_id, 3, "调度器注册失败")
 
         except (ValueError, KeyError, TypeError) as e:
             logger.error(f"[ProactiveReply] [任务注册] 注册任务失败: {e}")
@@ -1080,14 +1081,15 @@ class ProactiveReplyPlugin(Star):
                         logger.error(f"[ProactiveReply] [问候计划] 任务[{task_id}]数据库保存失败，跳过调度器注册")
                         continue
 
-                    # 注册到调度器
+                    # 注册到调度器，失败则将 DB 任务标记为取消
                     if not self.scheduler.add_one_time_task(
                         task_id,
                         trigger_time,
                         self._execute_greeting_task,
                         task_id
                     ):
-                        logger.warning(f"[ProactiveReply] [问候计划] 任务[{task_id}]调度器注册失败，跳过")
+                        logger.warning(f"[ProactiveReply] [问候计划] 任务[{task_id}]调度器注册失败，标记为取消")
+                        await self.db.update_task_status(task_id, 3, "调度器注册失败")
                         continue
 
                     generated_count += 1
@@ -1250,14 +1252,15 @@ class ProactiveReplyPlugin(Star):
                                     logger.error(f"[ProactiveReply] [事件生成] 任务[{task_id}]数据库保存失败，跳过调度器注册")
                                     continue
 
-                                # 注册到调度器
+                                # 注册到调度器，失败则将 DB 任务标记为取消
                                 if not self.scheduler.add_one_time_task(
                                     task_id,
                                     trigger_time,
                                     self._execute_event_task,
                                     task_id
                                 ):
-                                    logger.warning(f"[ProactiveReply] [事件生成] 任务[{task_id}]调度器注册失败，跳过")
+                                    logger.warning(f"[ProactiveReply] [事件生成] 任务[{task_id}]调度器注册失败，标记为取消")
+                                    await self.db.update_task_status(task_id, 3, "调度器注册失败")
                                     continue
 
                                 registered_times.append(trigger_time)
@@ -1276,10 +1279,13 @@ class ProactiveReplyPlugin(Star):
                         logger.error(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]事件生成失败: {e}")
 
             # 分批并发处理，每批大小与信号量一致，避免一次性挂起大量协程
-            batch_size = self._llm_semaphore._value  # 与 Semaphore(5) 对齐
+            batch_size = _LLM_CONCURRENCY
             for i in range(0, len(users), batch_size):
                 batch = users[i:i + batch_size]
-                await asyncio.gather(*[process_user(uid) for uid in batch], return_exceptions=True)
+                results = await asyncio.gather(*[process_user(uid) for uid in batch], return_exceptions=True)
+                for uid, result in zip(batch, results):
+                    if isinstance(result, BaseException):
+                        logger.error(f"[ProactiveReply] [事件生成] 用户[{uid[:16]}...]处理异常: {result}")
 
             logger.info("[ProactiveReply] [定时任务] 每日事件生成完成")
 
@@ -1402,10 +1408,13 @@ class ProactiveReplyPlugin(Star):
                                 logger.error(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]梯度2触达失败: {e}")
 
             # 分批并发处理，每批大小与信号量一致，避免一次性挂起大量协程
-            batch_size = self._llm_semaphore._value
+            batch_size = _LLM_CONCURRENCY
             for i in range(0, len(users), batch_size):
                 batch = users[i:i + batch_size]
-                await asyncio.gather(*[process_user(uid) for uid in batch], return_exceptions=True)
+                results = await asyncio.gather(*[process_user(uid) for uid in batch], return_exceptions=True)
+                for uid, result in zip(batch, results):
+                    if isinstance(result, BaseException):
+                        logger.error(f"[ProactiveReply] [未活跃触达] 用户[{uid[:16]}...]处理异常: {result}")
 
             logger.info("[ProactiveReply] [定时任务] 未活跃用户扫描完成")
 
@@ -1608,6 +1617,14 @@ class ProactiveReplyPlugin(Star):
         try:
             logger.info("[ProactiveReply] [插件卸载] 开始卸载插件")
 
+            # 取消初始化任务（若仍在运行）
+            if hasattr(self, '_init_task') and not self._init_task.done():
+                self._init_task.cancel()
+                try:
+                    await self._init_task
+                except asyncio.CancelledError:
+                    pass
+
             # 取消所有对话倒计时任务
             for user_id, task in list(self.conversation_timers.items()):
                 if not task.done():
@@ -1615,12 +1632,10 @@ class ProactiveReplyPlugin(Star):
                     logger.debug(f"[ProactiveReply] [插件卸载] 取消用户[{user_id[:16]}...]的对话倒计时任务")
             self.conversation_timers.clear()
 
-            # 关闭调度器（等待所有任务完成）
+            # 关闭调度器（非阻塞，避免在事件循环中同步等待任务完成）
             if self.scheduler.is_running:
-                logger.info("[ProactiveReply] [插件卸载] 正在关闭调度器，等待任务完成...")
-                await self.scheduler.shutdown(wait=True)
-                # 等待一小段时间确保任务完成
-                await asyncio.sleep(0.5)
+                logger.info("[ProactiveReply] [插件卸载] 正在关闭调度器...")
+                await self.scheduler.shutdown(wait=False)
 
             # 关闭数据库
             await self.db.close()

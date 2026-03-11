@@ -64,85 +64,89 @@ class DatabaseManager:
 
     async def _create_tables(self):
         """创建数据库表"""
-        cursor = self.conn.cursor()
+        def _create():
+            cursor = self.conn.cursor()
 
-        # 用户基础信息表
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS user_base_info (
-                user_id TEXT PRIMARY KEY,
-                last_active_time INTEGER NOT NULL,
-                last_1d_inactive_touch_time INTEGER DEFAULT 0,
-                last_6d_inactive_touch_time INTEGER DEFAULT 0,
-                today_greeting_count INTEGER DEFAULT 0,
-                today_event_count INTEGER DEFAULT 0,
-                create_time INTEGER NOT NULL,
-                update_time INTEGER NOT NULL
-            )
-        """)
+            # 用户基础信息表
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_base_info (
+                    user_id TEXT PRIMARY KEY,
+                    last_active_time INTEGER NOT NULL,
+                    last_1d_inactive_touch_time INTEGER DEFAULT 0,
+                    last_6d_inactive_touch_time INTEGER DEFAULT 0,
+                    today_greeting_count INTEGER DEFAULT 0,
+                    today_event_count INTEGER DEFAULT 0,
+                    create_time INTEGER NOT NULL,
+                    update_time INTEGER NOT NULL
+                )
+            """)
 
-        # 待执行任务表
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS pending_tasks (
-                task_id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                trigger_time INTEGER NOT NULL,
-                task_type TEXT NOT NULL,
-                task_context TEXT,
-                create_time INTEGER NOT NULL,
-                status INTEGER DEFAULT 0,
-                exec_time INTEGER DEFAULT 0,
-                fail_reason TEXT
-            )
-        """)
+            # 待执行任务表
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS pending_tasks (
+                    task_id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    trigger_time INTEGER NOT NULL,
+                    task_type TEXT NOT NULL,
+                    task_context TEXT,
+                    create_time INTEGER NOT NULL,
+                    status INTEGER DEFAULT 0,
+                    exec_time INTEGER DEFAULT 0,
+                    fail_reason TEXT
+                )
+            """)
 
-        # 日常事件表
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS daily_events (
-                event_id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                event_date TEXT NOT NULL,
-                trigger_time INTEGER NOT NULL,
-                weather TEXT,
-                event_content TEXT NOT NULL,
-                status INTEGER DEFAULT 0,
-                create_time INTEGER NOT NULL
-            )
-        """)
+            # 日常事件表
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS daily_events (
+                    event_id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    event_date TEXT NOT NULL,
+                    trigger_time INTEGER NOT NULL,
+                    weather TEXT,
+                    event_content TEXT NOT NULL,
+                    status INTEGER DEFAULT 0,
+                    create_time INTEGER NOT NULL
+                )
+            """)
 
-        # 消息发送记录表（用于频率限制）
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS message_send_records (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT NOT NULL,
-                send_time INTEGER NOT NULL,
-                message_type TEXT,
-                create_time INTEGER NOT NULL
-            )
-        """)
+            # 消息发送记录表（用于频率限制）
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS message_send_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    send_time INTEGER NOT NULL,
+                    message_type TEXT,
+                    create_time INTEGER NOT NULL
+                )
+            """)
 
-        # 创建索引以提高查询效率
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_send_records_user_time
-            ON message_send_records(user_id, send_time)
-        """)
+            # 创建索引以提高查询效率
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_send_records_user_time
+                ON message_send_records(user_id, send_time)
+            """)
 
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_pending_tasks_user_id
-            ON pending_tasks(user_id)
-        """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_pending_tasks_user_id
+                ON pending_tasks(user_id)
+            """)
 
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_pending_tasks_task_id
-            ON pending_tasks(task_id)
-        """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_pending_tasks_task_id
+                ON pending_tasks(task_id)
+            """)
 
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_pending_tasks_status
-            ON pending_tasks(status, trigger_time)
-        """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_pending_tasks_status
+                ON pending_tasks(status, trigger_time)
+            """)
 
-        self.conn.commit()
-        logger.info("[ProactiveReply] [数据库] 数据表创建完成")
+            self.conn.commit()
+            logger.info("[ProactiveReply] [数据库] 数据表创建完成")
+
+        async with self._db_lock:
+            await asyncio.to_thread(_create)
 
     async def _get_db_version(self) -> int:
         """获取当前数据库版本号"""
@@ -192,7 +196,8 @@ class DatabaseManager:
             except Exception as e:
                 logger.error(f"[ProactiveReply] [数据库迁移] 设置数据库版本发生未知错误: {e}")
 
-        await asyncio.to_thread(_set)
+        async with self._db_lock:
+            await asyncio.to_thread(_set)
 
     async def _migrate_database(self):
         """执行数据库迁移"""
@@ -514,8 +519,10 @@ class DatabaseManager:
         async with self._db_lock:
             await asyncio.to_thread(_reset)
 
-    async def increment_greeting_count(self, user_id: str):
+    async def increment_greeting_count(self, user_id: str) -> bool:
         """增加用户问候次数"""
+        result = [False]
+
         def _increment():
             try:
                 cursor = self.conn.cursor()
@@ -525,6 +532,7 @@ class DatabaseManager:
                     WHERE user_id = ?
                 """, (user_id,))
                 self.conn.commit()
+                result[0] = True
             except sqlite3.Error as e:
                 logger.error(f"[ProactiveReply] [数据库] 增加问候次数失败: {e}")
             except Exception as e:
@@ -532,9 +540,12 @@ class DatabaseManager:
 
         async with self._db_lock:
             await asyncio.to_thread(_increment)
+        return result[0]
 
-    async def increment_event_count(self, user_id: str):
+    async def increment_event_count(self, user_id: str) -> bool:
         """增加用户事件次数"""
+        result = [False]
+
         def _increment():
             try:
                 cursor = self.conn.cursor()
@@ -544,6 +555,7 @@ class DatabaseManager:
                     WHERE user_id = ?
                 """, (user_id,))
                 self.conn.commit()
+                result[0] = True
             except sqlite3.Error as e:
                 logger.error(f"[ProactiveReply] [数据库] 增加事件次数失败: {e}")
             except Exception as e:
@@ -551,6 +563,7 @@ class DatabaseManager:
 
         async with self._db_lock:
             await asyncio.to_thread(_increment)
+        return result[0]
 
     async def get_all_users(self) -> List[str]:
         """获取所有用户ID列表"""
@@ -610,7 +623,7 @@ class DatabaseManager:
         async with self._db_lock:
             return await asyncio.to_thread(_get)
 
-    async def record_message_sent(self, user_id: str, message_type: str = ""):
+    async def record_message_sent(self, user_id: str, message_type: str = "") -> bool:
         """
         记录消息发送
 
@@ -618,6 +631,8 @@ class DatabaseManager:
             user_id: 用户ID
             message_type: 消息类型
         """
+        result = [False]
+
         def _record():
             try:
                 cursor = self.conn.cursor()
@@ -630,6 +645,7 @@ class DatabaseManager:
                 """, (user_id, now, message_type, now))
 
                 self.conn.commit()
+                result[0] = True
             except sqlite3.Error as e:
                 logger.error(f"[ProactiveReply] [数据库] 记录消息发送失败: {e}")
             except Exception as e:
@@ -637,6 +653,7 @@ class DatabaseManager:
 
         async with self._db_lock:
             await asyncio.to_thread(_record)
+        return result[0]
 
     async def cleanup_old_send_records(self, days: int = 7):
         """

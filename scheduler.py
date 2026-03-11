@@ -5,6 +5,7 @@
 """
 from datetime import datetime, timedelta
 from typing import Callable, List
+import asyncio
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
@@ -45,7 +46,7 @@ class TaskScheduler:
         """
         try:
             if self.is_running:
-                self.scheduler.shutdown(wait=wait)
+                await asyncio.to_thread(self.scheduler.shutdown, wait=wait)
                 self.is_running = False
                 logger.info("[ProactiveReply] [定时任务] 调度器已关闭")
         except RuntimeError as e:
@@ -229,6 +230,10 @@ class TaskScheduler:
             check_time = check_time.astimezone(self.beijing_tz)
 
         hour = check_time.hour
+
+        # start == end 表示"全天防打扰"（与跨天逻辑连续：end 趋近 start 时区间趋向 24 小时），直接返回 True
+        if start_hour == end_hour:
+            return True
 
         # 处理跨天情况
         if start_hour <= end_hour:
