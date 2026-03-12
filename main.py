@@ -534,6 +534,14 @@ class ProactiveReplyPlugin(Star):
             user_id: 用户ID
         """
         try:
+            # 检查是否在免打扰时段
+            now = self.scheduler.get_beijing_time()
+            disturb_start = self.config["disturb_free_start"]
+            disturb_end = self.config["disturb_free_end"]
+            if self.scheduler.is_in_disturb_free_time(now, disturb_start, disturb_end):
+                logger.info(f"[ProactiveReply] [对话结束处理] 当前时间在免打扰时段内，跳过对话总结和主动回复")
+                return
+
             # 1. 获取对话历史
             conv_mgr = self.context.conversation_manager
             curr_cid = await conv_mgr.get_curr_conversation_id(user_id)
@@ -852,16 +860,30 @@ class ProactiveReplyPlugin(Star):
             # 获取人设
             persona_mgr = self.context.persona_manager
             persona = await persona_mgr.get_default_persona_v3(umo=user_id)
-            persona_prompt = persona.prompt if persona and hasattr(persona, 'prompt') else ""
+            persona_prompt = persona.prompt
+
+            # 检查人设是否为空
+            if not persona_prompt.strip():
+                logger.warning(f"[ProactiveReply] [消息生成] 用户[{user_id[:16]}...]人设为空，使用默认人设")
+                persona_prompt = "你是一个友善、温暖的朋友"
+
+            # 获取对话背景
+            summary = task_context.get('summary', '')
+            if not summary or not summary.strip():
+                logger.warning(f"[ProactiveReply] [消息生成] 用户[{user_id[:16]}...]对话背景为空")
+                summary = "最近的对话"
 
             # 构建提示词
-            prompt = f"""你获得了一次主动回复的机会，请保持人设不变，结合以下内容生成一条自然的主动消息。
+            now = self.scheduler.get_beijing_time()
+            prompt = f"""请基于以下角色设定，生成一条自然的主动消息。
 
-人设：{persona_prompt}
+角色设定：{persona_prompt}
 
-对话背景：{task_context.get('summary', '')}
+最近对话内容：{summary}
 
-请生成一条简短、自然的主动消息（不超过50字）。"""
+当前时间：{now.strftime('%Y-%m-%d %H:%M')}
+
+要求：直接生成一条简短、自然的消息（不超过50字），不要有任何说明或解释。"""
 
             # 调用 LLM，失败最多重试2次
             provider_id = await self.context.get_current_chat_provider_id(umo=user_id)
@@ -1132,7 +1154,19 @@ class ProactiveReplyPlugin(Star):
                         provider_id = await self.context.get_current_chat_provider_id(umo=user_id)
                         now = self.scheduler.get_beijing_time()
 
-                        prompt = f"""请基于角色人设，生成最多{max_event_count - event_count}个符合今天的日常事件。
+                        # 获取人设
+                        persona_mgr = self.context.persona_manager
+                        persona = await persona_mgr.get_default_persona_v3(umo=user_id)
+                        persona_prompt = persona.prompt
+
+                        # 检查人设是否为空
+                        if not persona_prompt.strip():
+                            logger.warning(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]人设为空，使用默认人设")
+                            persona_prompt = "你是一个友善、温暖的朋友"
+
+                        prompt = f"""请基于以下角色设定，生成最多{max_event_count - event_count}个符合今天的日常事件。
+
+角色设定：{persona_prompt}
 
 当前日期：{now.strftime('%Y-%m-%d')}
 当前时间：{now.strftime('%H:%M')}
@@ -1147,7 +1181,7 @@ class ProactiveReplyPlugin(Star):
 注意：
 - 事件时间必须晚于当前时间
 - 两个事件间隔至少4小时
-- 事件要符合角色人设和日常习惯"""
+- 事件要符合角色设定和日常习惯"""
 
                         try:
                             llm_resp = await asyncio.wait_for(
@@ -1316,25 +1350,33 @@ class ProactiveReplyPlugin(Star):
                     # 1天未活跃触达（24小时）
                     if hours_inactive >= INACTIVE_1D_HOURS and hours_inactive < INACTIVE_6D_HOURS:
                         if self.config["enable_inactive_1d_touch"] and user_info['last_1d_inactive_touch_time'] == 0:
+                            # 检查是否在免打扰时段
+                            disturb_start = self.config["disturb_free_start"]
+                            disturb_end = self.config["disturb_free_end"]
+                            if self.scheduler.is_in_disturb_free_time(now, disturb_start, disturb_end):
+                                logger.info(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]当前时间在免打扰时段内，跳过触达")
+                                return
+
                             logger.info(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]已{int(hours_inactive/24)}天未活跃，触发梯度1触达")
 
                             try:
                                 provider_id = await self.context.get_current_chat_provider_id(umo=user_id)
                                 persona_mgr = self.context.persona_manager
                                 persona = await persona_mgr.get_default_persona_v3(umo=user_id)
-                                persona_prompt = persona.prompt if persona and hasattr(persona, 'prompt') else ""
+                                persona_prompt = persona.prompt
 
-                                prompt = f"""请基于角色人设，生成一条自然的问候/关心消息，因为用户已经1天没有和你聊天了。
+                                # 检查人设是否为空
+                                if not persona_prompt.strip():
+                                    logger.warning(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]人设为空，使用默认人设")
+                                    persona_prompt = "你是一个友善、温暖的朋友"
 
-人设：{persona_prompt}
+                                prompt = f"""请基于以下角色设定，生成一条关心问候的消息。
 
-要求：
-- 保持人设不变
-- 语气自然、关心
-- 不要太长，1-2句话即可
-- 不要提及"1天"这个具体时间
+角色设定：{persona_prompt}
 
-直接输出消息内容，不要有其他说明。"""
+背景：用户已经1天没有和你聊天了
+
+要求：直接生成一条自然、关心的问候消息（1-2句话），不要提及具体天数，不要有任何说明或解释。"""
 
                                 try:
                                     llm_resp = await asyncio.wait_for(
@@ -1363,25 +1405,33 @@ class ProactiveReplyPlugin(Star):
                     # 6天未活跃触达（144小时）
                     elif hours_inactive >= INACTIVE_6D_HOURS:
                         if self.config["enable_inactive_6d_touch"] and user_info['last_6d_inactive_touch_time'] == 0:
+                            # 检查是否在免打扰时段
+                            disturb_start = self.config["disturb_free_start"]
+                            disturb_end = self.config["disturb_free_end"]
+                            if self.scheduler.is_in_disturb_free_time(now, disturb_start, disturb_end):
+                                logger.info(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]当前时间在免打扰时段内，跳过触达")
+                                return
+
                             logger.info(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]已{int(hours_inactive/24)}天未活跃，触发梯度2触达")
 
                             try:
                                 provider_id = await self.context.get_current_chat_provider_id(umo=user_id)
                                 persona_mgr = self.context.persona_manager
                                 persona = await persona_mgr.get_default_persona_v3(umo=user_id)
-                                persona_prompt = persona.prompt if persona and hasattr(persona, 'prompt') else ""
+                                persona_prompt = persona.prompt
 
-                                prompt = f"""请基于角色人设，生成一条带点生气、质问语气的消息，因为用户已经超过6天没有和你聊天了。
+                                # 检查人设是否为空
+                                if not persona_prompt.strip():
+                                    logger.warning(f"[ProactiveReply] [未活跃触达] 用户[{user_id[:16]}...]人设为空，使用默认人设")
+                                    persona_prompt = "你是一个友善、温暖的朋友"
 
-人设：{persona_prompt}
+                                prompt = f"""请基于以下角色设定，生成一条带有不满情绪的消息。
 
-要求：
-- 保持人设不变
-- 语气带点生气、质问，但不要太过分
-- 可以表达想念、不满等情绪
-- 1-2句话即可
+角色设定：{persona_prompt}
 
-直接输出消息内容，不要有其他说明。"""
+背景：用户已经很久没有和你聊天了
+
+要求：直接生成一条带点生气、质问语气的消息（1-2句话），可以表达想念或不满，不要有任何说明或解释。"""
 
                                 try:
                                     llm_resp = await asyncio.wait_for(
@@ -1452,21 +1502,20 @@ class ProactiveReplyPlugin(Star):
                 # 获取人设
                 persona_mgr = self.context.persona_manager
                 persona = await persona_mgr.get_default_persona_v3(umo=user_id)
-                persona_prompt = persona.prompt if persona and hasattr(persona, 'prompt') else ""
+                persona_prompt = persona.prompt
 
-                prompt = f"""请基于角色人设，生成一条{time_range}的日常问候消息。
+                # 检查人设是否为空
+                if not persona_prompt.strip():
+                    logger.warning(f"[ProactiveReply] [任务执行] 用户[{user_id[:16]}...]人设为空，使用默认人设")
+                    persona_prompt = "你是一个友善、温暖的朋友"
 
-人设：{persona_prompt}
+                prompt = f"""请基于以下角色设定，生成一条{time_range}的问候消息。
+
+角色设定：{persona_prompt}
 
 当前时间：{now.strftime('%H:%M')}
 
-要求：
-- 保持人设不变
-- 符合当前时段的特点
-- 自然、简短，1-2句话
-- 不要太正式
-
-直接输出消息内容，不要有其他说明。"""
+要求：直接生成一条自然、简短的问候消息（1-2句话），不要有任何说明或解释。"""
 
                 try:
                     llm_resp = None
@@ -1547,21 +1596,20 @@ class ProactiveReplyPlugin(Star):
                 # 获取人设
                 persona_mgr = self.context.persona_manager
                 persona = await persona_mgr.get_default_persona_v3(umo=user_id)
-                persona_prompt = persona.prompt if persona and hasattr(persona, 'prompt') else ""
+                persona_prompt = persona.prompt
 
-                prompt = f"""请基于角色人设，以这件事为话题，生成一条自然的主动消息发给用户。
+                # 检查人设是否为空
+                if not persona_prompt.strip():
+                    logger.warning(f"[ProactiveReply] [任务执行] 用户[{user_id[:16]}...]人设为空，使用默认人设")
+                    persona_prompt = "你是一个友善、温暖的朋友"
 
-人设：{persona_prompt}
+                prompt = f"""请基于以下角色设定，以这件事为话题生成一条自然的消息。
 
-事件内容：{event_content}
+角色设定：{persona_prompt}
 
-要求：
-- 保持人设不变
-- 你现在正在做这件事
-- 以这件事为话题，自然地分享给用户
-- 1-2句话即可
+正在做的事：{event_content}
 
-直接输出消息内容，不要有其他说明。"""
+要求：直接生成一条简短、自然的消息（1-2句话），分享你正在做的事，不要有任何说明或解释。"""
 
                 try:
                     llm_resp = None
