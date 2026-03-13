@@ -860,7 +860,7 @@ class ProactiveReplyPlugin(Star):
             # 获取人设
             persona_mgr = self.context.persona_manager
             persona = await persona_mgr.get_default_persona_v3(umo=user_id)
-            persona_prompt = persona.prompt
+            persona_prompt = persona.get('prompt', '')
 
             # 检查人设是否为空
             if not persona_prompt.strip():
@@ -1157,7 +1157,7 @@ class ProactiveReplyPlugin(Star):
                         # 获取人设
                         persona_mgr = self.context.persona_manager
                         persona = await persona_mgr.get_default_persona_v3(umo=user_id)
-                        persona_prompt = persona.prompt
+                        persona_prompt = persona.get('prompt', '')
 
                         # 检查人设是否为空
                         if not persona_prompt.strip():
@@ -1363,7 +1363,7 @@ class ProactiveReplyPlugin(Star):
                                 provider_id = await self.context.get_current_chat_provider_id(umo=user_id)
                                 persona_mgr = self.context.persona_manager
                                 persona = await persona_mgr.get_default_persona_v3(umo=user_id)
-                                persona_prompt = persona.prompt
+                                persona_prompt = persona.get('prompt', '')
 
                                 # 检查人设是否为空
                                 if not persona_prompt.strip():
@@ -1418,7 +1418,7 @@ class ProactiveReplyPlugin(Star):
                                 provider_id = await self.context.get_current_chat_provider_id(umo=user_id)
                                 persona_mgr = self.context.persona_manager
                                 persona = await persona_mgr.get_default_persona_v3(umo=user_id)
-                                persona_prompt = persona.prompt
+                                persona_prompt = persona.get('prompt', '')
 
                                 # 检查人设是否为空
                                 if not persona_prompt.strip():
@@ -1502,7 +1502,7 @@ class ProactiveReplyPlugin(Star):
                 # 获取人设
                 persona_mgr = self.context.persona_manager
                 persona = await persona_mgr.get_default_persona_v3(umo=user_id)
-                persona_prompt = persona.prompt
+                persona_prompt = persona.get('prompt', '')
 
                 # 检查人设是否为空
                 if not persona_prompt.strip():
@@ -1596,7 +1596,7 @@ class ProactiveReplyPlugin(Star):
                 # 获取人设
                 persona_mgr = self.context.persona_manager
                 persona = await persona_mgr.get_default_persona_v3(umo=user_id)
-                persona_prompt = persona.prompt
+                persona_prompt = persona.get('prompt', '')
 
                 # 检查人设是否为空
                 if not persona_prompt.strip():
