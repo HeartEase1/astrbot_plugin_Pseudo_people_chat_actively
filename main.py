@@ -1038,6 +1038,14 @@ class ProactiveReplyPlugin(Star):
                 if not user_info:
                     continue
 
+                # 检查用户是否超过1天未活跃
+                now_ts = self.scheduler.get_beijing_time()
+                last_active = datetime.fromtimestamp(user_info['last_active_time'], self.scheduler.beijing_tz)
+                hours_inactive = (now_ts - last_active).total_seconds() / 3600
+                if hours_inactive >= INACTIVE_1D_HOURS:
+                    logger.debug(f"[ProactiveReply] [问候计划] 用户[{user_id[:16]}...]已超过1天未活跃，跳过问候生成")
+                    continue
+
                 # 检查今日问候次数
                 greeting_count = user_info.get('today_greeting_count', 0)
                 max_count = self.config["daily_max_greeting_count"]
@@ -1141,6 +1149,14 @@ class ProactiveReplyPlugin(Star):
                 async with self._llm_semaphore:
                     user_info = await self.db.get_user_info(user_id)
                     if not user_info:
+                        return
+
+                    # 检查用户是否超过1天未活跃
+                    now_ts = self.scheduler.get_beijing_time()
+                    last_active = datetime.fromtimestamp(user_info['last_active_time'], self.scheduler.beijing_tz)
+                    hours_inactive = (now_ts - last_active).total_seconds() / 3600
+                    if hours_inactive >= INACTIVE_1D_HOURS:
+                        logger.debug(f"[ProactiveReply] [事件生成] 用户[{user_id[:16]}...]已超过1天未活跃，跳过事件生成")
                         return
 
                     # 检查今日事件次数
