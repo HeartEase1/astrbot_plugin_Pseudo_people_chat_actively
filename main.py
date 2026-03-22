@@ -952,6 +952,12 @@ class ProactiveReplyPlugin(Star):
                 message_chain = MessageChain().message(message)
                 await self.context.send_message(user_id, message_chain)
 
+                # 将主动消息添加到对话历史
+                conv_mgr = self.context.conversation_manager
+                curr_cid = await conv_mgr.get_curr_conversation_id(user_id)
+                if curr_cid:
+                    await conv_mgr.add_message(user_id, curr_cid, "assistant", message)
+
                 # 发送成功后再记录，避免发送失败占用频控额度
                 await self.db.record_message_sent(user_id, "proactive")
 
